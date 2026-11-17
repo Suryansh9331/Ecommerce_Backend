@@ -1,17 +1,13 @@
-from flask import Blueprint, request, jsonify, send_file, abort, current_app
-from io import BytesIO
+from flask import Blueprint, request, jsonify
 from controllers.order_controller import OrderController
 from models.enums import OrderStatusEnum, PaymentStatusEnum, PaymentMethodEnum
 from auth.utils import role_required
-from auth.models.models import UserRole, User, MerchantProfile
+from auth.models.models import UserRole
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from models.order import Order, OrderItem
-from models.product import Product
-from models.user_address import UserAddress
 from sqlalchemy import func, desc
 from datetime import datetime, timedelta
 from common.database import db
-from common.invoice_pdf import generate_tax_invoice_pdf
 from flask_cors import cross_origin
 import logging
 
@@ -230,6 +226,61 @@ def get_order(order_id):
             'status': 'error',
             'message': str(e)
         }), 500
+
+
+@order_bp.route('/<string:order_id>/invoice', methods=['GET'])
+@jwt_required()
+@role_required([UserRole.USER.value, UserRole.ADMIN.value])
+def download_invoice(order_id):
+    """
+    Download a GST tax invoice (PDF) for a paid order owned by the current user.
+    ---
+    tags:
+      - Orders
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: order_id
+        type: string
+        required: true
+        description: ID of the order to invoice
+    responses:
+      200:
+        description: PDF invoice
+      400:
+        description: Order not paid yet
+      401:
+        description: Unauthorized
+      403:
+        description: Not allowed to view this invoice
+      404:
+        description: Order not found
+      500:
+        description: Internal server error
+    """
+    from services.invoice_service import build_invoice_data, InvoiceError
+    from services.invoice_pdf import render_invoice_pdf
+    from flask import make_response
+
+    try:
+        user_id = get_jwt_identity()
+        try:
+            data = build_invoice_data(order_id, user_id, require_paid=True)
+        except InvoiceError as ie:
+            return jsonify({'status': 'error', 'message': ie.message}), ie.status
+
+        pdf_bytes = render_invoice_pdf(data)
+        response = make_response(pdf_bytes)
+        response.headers['Content-Type'] = 'application/pdf'
+        response.headers['Content-Disposition'] = (
+            f'attachment; filename="invoice_{order_id}.pdf"'
+        )
+        return response
+    except Exception as e:
+        logger.error(f"Error generating invoice for order {order_id}: {str(e)}", exc_info=True)
+        return jsonify({'status': 'error', 'message': 'Failed to generate invoice'}), 500
+
 
 @order_bp.route('/user', methods=['GET'])
 @jwt_required()
@@ -1000,82 +1051,3 @@ def track_order(order_id):
             'status': 'error',
             'message': str(e)
         }), 500
-
-
-def _build_invoice_pdf_for_order(order, items):
-    """
-    Shared helper that assembles the PDF payload for a single merchant's items
-    in an order. `items` must all share the same merchant_id.
-    """
-    if not items:
-        abort(404, "No items for invoice")
-
-    merchant_id = items[0].merchant_id
-    merchant = MerchantProfile.query.get(merchant_id) if merchant_id else None
-    if not merchant:
-        abort(404, "Seller profile not found for this order")
-
-    buyer_user = User.query.get(order.user_id)
-    buyer_address = (
-        UserAddress.query.get(order.shipping_address_id)
-        if order.shipping_address_id else None
-    )
-
-    product_ids = [it.product_id for it in items if it.product_id]
-    products_by_id = {
-        p.product_id: p
-        for p in Product.query.filter(Product.product_id.in_(product_ids)).all()
-    } if product_ids else {}
-
-    pdf_bytes = generate_tax_invoice_pdf(
-        order=order,
-        merchant=merchant,
-        items=items,
-        products_by_id=products_by_id,
-        buyer_user=buyer_user,
-        buyer_address=buyer_address,
-    )
-    return pdf_bytes
-
-
-@order_bp.route('/<string:order_id>/invoice.pdf', methods=['GET'])
-@jwt_required()
-def customer_download_invoice(order_id):
-    """
-    Customer downloads their own tax invoice for a given order.
-    Supports ?merchant_id=<id> to pick a specific seller when an order spans
-    multiple merchants; defaults to the first merchant in the order.
-    """
-    user_id = int(get_jwt_identity())
-    order = Order.query.filter_by(order_id=order_id, user_id=user_id).first()
-    if not order:
-        abort(404, "Order not found")
-
-    merchant_filter_id = request.args.get('merchant_id', type=int)
-    items_q = OrderItem.query.filter_by(order_id=order_id)
-    if merchant_filter_id is not None:
-        items_q = items_q.filter(OrderItem.merchant_id == merchant_filter_id)
-    items = items_q.all()
-
-    if not items:
-        abort(404, "No items for this order")
-
-    # If no explicit merchant and the order spans multiple sellers, default to
-    # the first merchant seen. Callers can request /invoice.pdf?merchant_id=N
-    # to get each seller's invoice separately.
-    if merchant_filter_id is None:
-        first_mid = items[0].merchant_id
-        items = [it for it in items if it.merchant_id == first_mid]
-
-    try:
-        pdf_bytes = _build_invoice_pdf_for_order(order, items)
-    except Exception as e:
-        current_app.logger.exception("Invoice render failed")
-        return jsonify({"error": f"Failed to generate invoice: {str(e)}"}), 500
-
-    return send_file(
-        BytesIO(pdf_bytes),
-        mimetype='application/pdf',
-        as_attachment=False,
-        download_name=f"invoice-{order_id}.pdf",
-    ) 

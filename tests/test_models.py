@@ -2,42 +2,47 @@
 Model-level regression tests that don't require a live DB connection.
 
 Covers:
-  * AuthProvider enum uses values_callable so lowercase MySQL columns accept
-    writes (the bug we hit on local setup).
+  * AuthProvider column uses the custom AuthProviderType TypeDecorator so
+    writes land as lowercase strings matching MySQL's enum('local','google','phone').
   * Product model exposes all 11 Meesho-wizard columns as nullable.
   * Soft-delete column is present and nullable on Product.
 """
 import pytest
-from sqlalchemy import Enum as SAEnum
 
 
 # --- AuthProvider enum regression ---
 
 @pytest.mark.unit
-def test_auth_provider_column_uses_enum_values_not_names():
+def test_auth_provider_column_uses_custom_type_decorator():
     """
-    The column must serialize by Python enum .value ('local', 'google'), not
-    by .name ('LOCAL', 'GOOGLE'). Otherwise MySQL rejects the INSERT because
-    the production column is enum('local','google','phone').
+    The column must use the AuthProviderType TypeDecorator so SQLAlchemy writes
+    lowercase enum .value ('local', 'google', 'phone') to match MySQL's
+    enum('local','google','phone') column. Plain SAEnum on this enum would
+    serialize by NAME ('LOCAL') and the INSERT would fail.
     """
-    from auth.models.models import User, AuthProvider
+    from auth.models.models import User, AuthProviderType
 
     col = User.__table__.c.auth_provider
-    enum_type = col.type
-    assert isinstance(enum_type, SAEnum)
+    # TypeDecorator exposes its underlying impl type (VARCHAR / String);
+    # the critical thing is the column uses AuthProviderType's bind-param
+    # converter, not SQLAlchemy's enum-by-name behavior.
+    assert isinstance(col.type, AuthProviderType), (
+        "auth_provider column must use AuthProviderType so writes become lowercase "
+        "strings matching the MySQL enum('local','google','phone') column."
+    )
 
-    # If values_callable is set on the Enum type, SQLAlchemy uses it to
-    # produce the allowed values for the column. We assert the resulting
-    # values are the lowercase .value strings.
-    callable_ = enum_type.values_callable
-    assert callable_ is not None, (
-        "auth_provider must declare values_callable; otherwise SQLAlchemy "
-        "would serialize by enum NAME ('LOCAL') and prod MySQL rejects it."
-    )
-    values = list(callable_(AuthProvider))
-    assert values == ["local", "google"], (
-        f"Expected lowercase values, got {values}"
-    )
+
+@pytest.mark.unit
+def test_auth_provider_type_bind_param_lowercases_enum_values():
+    """TypeDecorator.process_bind_param must emit the lowercase enum .value."""
+    from auth.models.models import AuthProviderType, AuthProvider
+
+    tp = AuthProviderType()
+    assert tp.process_bind_param(AuthProvider.LOCAL, dialect=None) == "local"
+    assert tp.process_bind_param(AuthProvider.GOOGLE, dialect=None) == "google"
+    # Also tolerates raw strings and normalizes them
+    assert tp.process_bind_param("LOCAL", dialect=None) == "local"
+    assert tp.process_bind_param(None, dialect=None) is None
 
 
 @pytest.mark.unit

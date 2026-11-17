@@ -136,9 +136,12 @@ def send_email(to_email, subject, template_str, context):
         current_app.logger.info(f"Attempting to send email to {to_email}")
 
         # Add base context variables to every email
+        frontend_url = current_app.config.get('FRONTEND_URL', '#')
+        if frontend_url != '#':
+            frontend_url = frontend_url.rstrip('/')
         context.update({
             'logo_url': 'https://res.cloudinary.com/dyj7ebc7z/image/upload/v1751606177/logo_nifepq.png', 
-            'frontend_url': current_app.config.get('FRONTEND_URL', '#'),
+            'frontend_url': frontend_url,
             'year': datetime.now().year,
             'subject': subject
         })
@@ -166,24 +169,35 @@ def send_email(to_email, subject, template_str, context):
         message['To'] = to_email
         message.attach(MIMEText(full_html_content, 'html', 'utf-8'))
         
-        with smtplib.SMTP(current_app.config['MAIL_SERVER'], current_app.config['MAIL_PORT']) as server:
+        # Add timeout to prevent hanging connections (10 seconds)
+        with smtplib.SMTP(current_app.config['MAIL_SERVER'], current_app.config['MAIL_PORT'], timeout=10) as server:
             if current_app.config['MAIL_USE_TLS']:
                 server.starttls()
             if current_app.config['MAIL_USERNAME'] and current_app.config['MAIL_PASSWORD']:
                 server.login(current_app.config['MAIL_USERNAME'], current_app.config['MAIL_PASSWORD'])
             server.sendmail(sender_address, to_email, message.as_string())
         
-        current_app.logger.info("Email sent successfully")
+        current_app.logger.info(f"Email sent successfully to {to_email}")
         return True
     
+    except smtplib.SMTPAuthenticationError as e:
+        current_app.logger.error(f"SMTP Authentication failed: {str(e)}. Check MAIL_USERNAME and MAIL_PASSWORD.")
+        return False
+    except smtplib.SMTPConnectError as e:
+        current_app.logger.error(f"SMTP Connection failed: {str(e)}. Check MAIL_SERVER and MAIL_PORT.")
+        return False
+    except smtplib.SMTPException as e:
+        current_app.logger.error(f"SMTP error while sending email to {to_email}: {str(e)}")
+        return False
     except Exception as e:
-        current_app.logger.error(f"Failed to send email: {str(e)}")
+        current_app.logger.error(f"Failed to send email to {to_email}: {str(e)}", exc_info=True)
         return False
 
 
 def send_verification_email(user, token):
     """Sends email verification with the new AOIN theme."""
-    verification_link = f"{current_app.config['FRONTEND_URL']}/verify-email/{token}"
+    frontend_url = current_app.config['FRONTEND_URL'].rstrip('/')
+    verification_link = f"{frontend_url}/verify-email/{token}"
     
     template_content = """
         <p>Hello {{ name }},</p>
@@ -211,9 +225,42 @@ def send_verification_email(user, token):
         context
     )
 
+def send_verification_email_otp(user, otp):
+    """Sends an OTP-based email verification (for app-based merchant onboarding).
+
+    Unlike send_verification_email (which embeds a clickable link for the website),
+    this email contains a 6-digit code the user types into the app, so there is no
+    browser navigation. Returns True on success, False otherwise.
+    """
+    template_content = """
+        <p>Hello {{ name }},</p>
+        <p>Use the verification code below to verify your email address in the app:</p>
+        <div class="button-wrapper">
+            <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; margin: 16px 0;">{{ otp }}</p>
+        </div>
+        <p>This code will expire in {{ expiry_minutes }} minutes.</p>
+        <p>If you did not request this, please ignore this email.</p>
+        <p>Best regards,<br>The Team</p>
+    """
+
+    context = {
+        'name': f"{user.first_name} {user.last_name}",
+        'otp': otp,
+        'expiry_minutes': current_app.config.get('MERCHANT_EMAIL_OTP_EXPIRY_MIN', 10),
+        'heading': "Email Verification"
+    }
+
+    return send_email(
+        user.email,
+        "Your AOIN Email Verification Code",
+        template_content,
+        context
+    )
+
 def send_password_reset_email(user, token):
     """Sends password reset email with the new AOIN theme."""
-    reset_link = f"{current_app.config['FRONTEND_URL']}/password/reset?token={token}"
+    frontend_url = current_app.config['FRONTEND_URL'].rstrip('/')
+    reset_link = f"{frontend_url}/password/reset?token={token}"
     
     template_content = """
         <p>Hello {{ name }},</p>
@@ -252,7 +299,8 @@ def send_merchant_docs_submitted_to_admin(merchant_profile, admin_email_list=Non
 
     merchant_user = merchant_profile.user 
     merchant_name = f"{merchant_user.first_name} {merchant_user.last_name}" if merchant_user else "N/A"
-    admin_link = f"{current_app.config['FRONTEND_URL']}/superadmin/merchant-management" 
+    frontend_url = current_app.config['FRONTEND_URL'].rstrip('/')
+    admin_link = f"{frontend_url}/superadmin/merchant-management" 
 
     template_content = """
         <p>Hello Admin,</p>
@@ -281,7 +329,8 @@ def send_merchant_docs_submitted_to_admin(merchant_profile, admin_email_list=Non
 
 def send_merchant_document_rejection_email(merchant_user, merchant_profile, document, admin_notes):
     """Notifies merchant of document rejection with the new AOIN theme."""
-    merchant_dashboard_link = f"{current_app.config['FRONTEND_URL']}/business/verification" 
+    frontend_url = current_app.config['FRONTEND_URL'].rstrip('/')
+    merchant_dashboard_link = f"{frontend_url}/business/verification" 
     
     template_content = """
         <p>Dear {{ user_name }},</p>
@@ -308,7 +357,8 @@ def send_merchant_document_rejection_email(merchant_user, merchant_profile, docu
 
 def send_merchant_profile_rejection_email(merchant_user, merchant_profile, reason):
     """Notifies merchant of profile rejection with the new AOIN theme."""
-    merchant_dashboard_link = f"{current_app.config['FRONTEND_URL']}/business/verification" 
+    frontend_url = current_app.config['FRONTEND_URL'].rstrip('/')
+    merchant_dashboard_link = f"{frontend_url}/business/verification" 
 
     template_content = """
         <p>Dear {{ user_name }},</p>
@@ -333,7 +383,8 @@ def send_merchant_profile_rejection_email(merchant_user, merchant_profile, reaso
 
 def send_merchant_profile_approval_email(merchant_user, merchant_profile):
     """Notifies merchant of profile approval with the new AOIN theme."""
-    merchant_dashboard_link = f"{current_app.config['FRONTEND_URL']}/business/dashboard" 
+    frontend_url = current_app.config['FRONTEND_URL'].rstrip('/')
+    merchant_dashboard_link = f"{frontend_url}/business/dashboard" 
 
     template_content = """
         <p>Dear {{ user_name }},</p>

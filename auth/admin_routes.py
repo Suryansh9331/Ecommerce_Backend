@@ -3,6 +3,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from auth.utils import admin_role_required
 from auth.models.models import User, MerchantProfile
 from auth.models.merchant_document import MerchantDocument
+from models.merchant_intro_video import MerchantIntroVideo
 
 # Create admin blueprint
 admin_bp = Blueprint('admin', __name__)
@@ -124,6 +125,12 @@ def get_all_merchants():
                 "verification_notes": profile.verification_notes,
                 "created_at": profile.created_at.isoformat(),
                 "updated_at": profile.updated_at.isoformat(),
+                "account_deleted_at": profile.account_deleted_at.isoformat()
+                if getattr(profile, "account_deleted_at", None)
+                else None,
+                "account_deletion_effective_at": profile.account_deletion_effective_at.isoformat()
+                if getattr(profile, "account_deletion_effective_at", None)
+                else None,
                 "user": {
                     "id": user.id,
                     "email": user.email,
@@ -402,6 +409,8 @@ def get_merchant_details(id):
                 "verified_at": doc.verified_at.isoformat() if doc.verified_at else None
             }
             
+        intro_video = MerchantIntroVideo.get_active_for_merchant(merchant_profile.id)
+
         # Format merchant data with country-specific fields
         merchant_data = {
             "id": merchant_profile.id,
@@ -427,6 +436,14 @@ def get_merchant_details(id):
                 "role": user.role.value
             },
             "documents": documents_data,
+            # Public profile content — surfaced here so the merchant-details
+            # screen can review it without a second call.
+            "username": merchant_profile.username,
+            "profile_img": merchant_profile.profile_img,
+            "bio": merchant_profile.bio,
+            "bio_link": merchant_profile.bio_link,
+            "bio_link_label": merchant_profile.bio_link_label,
+            "intro_video": intro_video.serialize(owner_view=True) if intro_video else None,
             # Common fields
             "bank_account_number": merchant_profile.bank_account_number,
             "bank_name": merchant_profile.bank_name,
@@ -466,3 +483,152 @@ def get_merchant_details(id):
         return jsonify(merchant_data), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# Reel moderation endpoints
+@admin_bp.route('/reels/<int:reel_id>/approve', methods=['POST'])
+@jwt_required()
+@admin_role_required
+def approve_reel(reel_id):
+    """
+    Approve a reel (admin only)
+    ---
+    tags:
+      - Admin
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: reel_id
+        type: integer
+        required: true
+        description: Reel ID
+    responses:
+      200:
+        description: Reel approved successfully
+      401:
+        description: Unauthorized
+      403:
+        description: Forbidden - User is not an admin
+      404:
+        description: Reel not found
+      500:
+        description: Internal server error
+    """
+    from controllers.reels_controller import ReelsController
+    return ReelsController.approve_reel(reel_id)
+
+@admin_bp.route('/reels/<int:reel_id>/reject', methods=['POST'])
+@jwt_required()
+@admin_role_required
+def reject_reel(reel_id):
+    """
+    Reject a reel with reason (admin only)
+    ---
+    tags:
+      - Admin
+    security:
+      - Bearer: []
+    consumes:
+      - application/json
+    parameters:
+      - in: path
+        name: reel_id
+        type: integer
+        required: true
+        description: Reel ID
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - rejection_reason
+          properties:
+            rejection_reason:
+              type: string
+              maxLength: 255
+              description: Reason for rejection
+    responses:
+      200:
+        description: Reel rejected successfully
+      400:
+        description: Invalid input
+      401:
+        description: Unauthorized
+      403:
+        description: Forbidden - User is not an admin
+      404:
+        description: Reel not found
+      500:
+        description: Internal server error
+    """
+    from controllers.reels_controller import ReelsController
+    return ReelsController.reject_reel(reel_id)
+
+@admin_bp.route('/reels/<int:reel_id>/hide', methods=['POST'])
+@jwt_required()
+@admin_role_required
+def hide_reel(reel_id):
+    """
+    Hide a reel from public view (admin only)
+    ---
+    tags:
+      - Admin
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: reel_id
+        type: integer
+        required: true
+        description: Reel ID
+    responses:
+      200:
+        description: Reel hidden successfully
+      401:
+        description: Unauthorized
+      403:
+        description: Forbidden - User is not an admin
+      404:
+        description: Reel not found
+      500:
+        description: Internal server error
+    """
+    from controllers.reels_controller import ReelsController
+    return ReelsController.hide_reel(reel_id)
+
+@admin_bp.route('/reels/pending', methods=['GET'])
+@jwt_required()
+@admin_role_required
+def get_pending_reels():
+    """
+    Get pending reels for moderation (admin only)
+    ---
+    tags:
+      - Admin
+    security:
+      - Bearer: []
+    parameters:
+      - in: query
+        name: page
+        type: integer
+        required: false
+        default: 1
+        description: Page number
+      - in: query
+        name: per_page
+        type: integer
+        required: false
+        default: 20
+        description: Items per page (max 100)
+    responses:
+      200:
+        description: List of pending reels
+      401:
+        description: Unauthorized
+      403:
+        description: Forbidden - User is not an admin
+      500:
+        description: Internal server error
+    """
+    from controllers.reels_controller import ReelsController
+    return ReelsController.get_pending_reels()

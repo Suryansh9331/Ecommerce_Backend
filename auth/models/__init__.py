@@ -4,6 +4,9 @@ from .models import (
     RefreshToken,
     EmailVerification,
     PhoneVerification,
+    CreatorSignupPending,
+    CreatorProfile,
+    CreatorCategory,
     UserRole,
     AuthProvider
 )

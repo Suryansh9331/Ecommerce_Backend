@@ -1,3 +1,10 @@
+"""
+Flask-Caching + optional direct Redis.
+
+Flask-Caching is forced to a null backend in create_app (no Redis for the extension by default).
+get_redis_client() is still used by features (auth, reels, translate, etc.) and may hit localhost
+or REDIS_URL. See docs/backend_cache_redis.md.
+"""
 import json
 import functools
 from flask_caching import Cache
@@ -7,14 +14,38 @@ import redis
 cache = Cache()
 
 def get_redis_client(app=None):
-    """Get Redis client based on app config or environment variables."""
-    if app and app.config.get('REDIS_URL'):
-        redis_url = app.config.get('REDIS_URL')
-    else:
-        # Fallback to default local Redis
-        redis_url = 'redis://localhost:6379/0'
-    
-    return redis.from_url(redis_url)
+    """Return a Redis client or None. Independent of Flask-Caching CACHE_TYPE=null.
+
+    Uses app.config['REDIS_URL'] when set; otherwise tries redis://localhost:6379/0.
+    On failure returns None (optional app.logger.warning).
+    """
+    try:
+        if app and app.config.get('REDIS_URL'):
+            redis_url = app.config.get('REDIS_URL')
+        else:
+            # Fallback to default local Redis
+            redis_url = 'redis://localhost:6379/0'
+        
+        # Create client with connection settings that prevent blocking
+        client = redis.from_url(
+            redis_url, 
+            socket_connect_timeout=1,  # Very short timeout
+            socket_timeout=1,
+            socket_keepalive=False,
+            retry_on_timeout=False,
+            health_check_interval=0
+        )
+        # Test connection with very short timeout
+        client.ping()
+        return client
+    except (redis.ConnectionError, redis.TimeoutError, OSError, Exception) as e:
+        # Log error if app context is available, but don't raise
+        if app:
+            try:
+                app.logger.warning(f"Redis connection failed: {str(e)}. Caching disabled.")
+            except:
+                pass  # Don't fail if logging fails
+        return None
 
 def cache_key_prefix(key_prefix):
     """Create a cache key prefix for differentiating cached data types."""
@@ -30,6 +61,16 @@ def cached(timeout=300, key_prefix='default'):
     def decorator(f):
         @functools.wraps(f)
         def decorated_function(*args, **kwargs):
+            # Skip caching if cache type is null or cache is not available
+            try:
+                from flask import current_app
+                if current_app.config.get('CACHE_TYPE') == 'null':
+                    # No caching - just execute the function
+                    return f(*args, **kwargs)
+            except:
+                # If we can't check config, skip caching
+                return f(*args, **kwargs)
+            
             # Generate a cache key based on function name and arguments
             key_parts = [key_prefix, f.__name__]
             for arg in args:
@@ -45,16 +86,20 @@ def cached(timeout=300, key_prefix='default'):
             cache_key = ":".join(key_parts)
             
             # Try to get result from cache
-            cached_result = cache.get(cache_key)
-            if cached_result:
-                return json.loads(cached_result)
+            try:
+                cached_result = cache.get(cache_key)
+                if cached_result:
+                    return json.loads(cached_result)
+            except Exception:
+                # If cache read fails, continue without cache
+                pass
             
             # Execute function and cache result
             result = f(*args, **kwargs)
             try:
                 cache.set(cache_key, json.dumps(result), timeout=timeout)
-            except (TypeError, ValueError):
-                # If result can't be JSON serialized, don't cache
+            except (TypeError, ValueError, Exception):
+                # If result can't be cached, just return it
                 pass
             
             return result

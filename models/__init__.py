@@ -7,6 +7,7 @@ from .product_stock import ProductStock
 from .product_tax import ProductTax
 from .product_shipping import ProductShipping
 from .product_meta import ProductMeta
+from .merchant_dimension_preset import MerchantDimensionPreset
 from .product_promotion import ProductPromotion
 from .product_placement import ProductPlacement
 from .subscription import SubscriptionPlan, SubscriptionHistory
@@ -16,6 +17,8 @@ from .attribute_value import AttributeValue
 from .product_tax import ProductTax
 from .product_shipping import ProductShipping
 from .promotion import Promotion
+from .promotion_redemption import PromotionRedemption
+from .plinko import PlinkoCampaign, PlinkoPrize, PlinkoLead
 from .product_promotion import ProductPromotion
 from .review import Review
 from .brand_request import BrandRequest
@@ -24,16 +27,33 @@ from .user_address import UserAddress
 from .wishlist_item import WishlistItem
 from .cart import Cart, CartItem
 from .order import Order, OrderItem, OrderStatusHistory
+from .checkout_quote import CheckoutQuote, CheckoutQuoteItem
+from .payment_refund import PaymentRefund
+from .fx_rate import FxRate
+from .song import Song
+from .reel_audio import ReelAudio
 from .shipment import Shipment, ShipmentItem
 from .shop.shop_order import ShopOrder, ShopOrderItem, ShopOrderStatusHistory
 from .shop.shop_shipment import ShopShipment, ShopShipmentItem
 from .visit_tracking import VisitTracking
+from .explore_banner import ExploreBannerItem
 
 
 from .gst_rule import GSTRule 
 from .enums import ProductPriceConditionType 
 
 from .payment_card import PaymentCard
+from .reel import Reel
+from .user_reel_like import UserReelLike
+from .user_reel_view import UserReelView
+from .user_reel_share import UserReelShare
+from .user_merchant_follow import UserMerchantFollow
+from .user_category_preference import UserCategoryPreference
+from .user_blocked_merchant import UserBlockedMerchant
+from .user_hidden_category import UserHiddenCategory
+from .merchant_notification import MerchantNotification
+from .merchant_intro_video import MerchantIntroVideo
+from .holi_giveaway_registration import HoliGiveawayRegistration
 
 
 __all__ = [
@@ -46,7 +66,12 @@ __all__ = [
     'ProductTax',
     'ProductShipping',
     'ProductMeta',
+    'MerchantDimensionPreset',
     'ProductPromotion',
+    'PromotionRedemption',
+    'PlinkoCampaign',
+    'PlinkoPrize',
+    'PlinkoLead',
     'ProductPlacement',
     'SubscriptionPlan',
     'SubscriptionHistory',
@@ -56,5 +81,23 @@ __all__ = [
     'ShopOrderItem', 
     'ShopOrderStatusHistory',
     'ShopShipment',
-    'ShopShipmentItem'
+    'ShopShipmentItem',
+    'Reel',
+    'UserReelLike',
+    'UserReelView',
+    'UserReelShare',
+    'UserMerchantFollow',
+    'UserCategoryPreference',
+    'UserBlockedMerchant',
+    'UserHiddenCategory',
+    'MerchantNotification',
+    'MerchantIntroVideo',
+    'HoliGiveawayRegistration',
+    'ExploreBannerItem',
+    'CheckoutQuote',
+    'CheckoutQuoteItem',
+    'PaymentRefund',
+    'FxRate',
+    'Song',
+    'ReelAudio'
 ]

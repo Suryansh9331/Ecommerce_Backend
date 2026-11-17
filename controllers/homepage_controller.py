@@ -1,5 +1,6 @@
 from models.homepage import HomepageCategory
 from models.product import Product
+from auth.models.models import MerchantProfile
 from models.category import Category
 from models.product_media import ProductMedia
 from models.enums import MediaType
@@ -22,10 +23,11 @@ class HomepageController:
             # Get category IDs that are active on homepage
             active_category_ids = [hc.category_id for hc in active_homepage_categories]
             
-            # Get all main categories that are active on homepage
+            # Get all main categories that are active on homepage and category is_active
             main_categories = Category.query.filter(
                 Category.category_id.in_(active_category_ids),
-                Category.parent_id.is_(None)
+                Category.parent_id.is_(None),
+                Category.is_active == True
             ).all()
             
             # Initialize response data
@@ -62,16 +64,26 @@ class HomepageController:
             def get_category_products(category_id, level=0):
                 """Recursively get all products from a category and its subcategories (excluding variants)"""
                 # Get direct products in this category that are approved and not variants
-                direct_products = Product.query.filter(
-                    Product.category_id == category_id,
-                    Product.active_flag == True,
-                    Product.deleted_at == None,
-                    Product.approval_status == 'approved',  # Only get approved products
-                    Product.parent_product_id.is_(None)  # Exclude variants
-                ).all()
+                direct_products = (
+                    Product.query.join(
+                        MerchantProfile, Product.merchant_id == MerchantProfile.id
+                    )
+                    .filter(
+                        MerchantProfile.account_deleted_at.is_(None),
+                        Product.category_id == category_id,
+                        Product.active_flag == True,
+                        Product.deleted_at == None,
+                        Product.approval_status == 'approved',
+                        Product.parent_product_id.is_(None),
+                    )
+                    .all()
+                )
                 
-                # Get all subcategories
-                subcategories = Category.query.filter_by(parent_id=category_id).all()
+                # Get all active subcategories
+                subcategories = Category.query.filter(
+                    Category.parent_id == category_id,
+                    Category.is_active == True
+                ).all()
                 
                 # Get products from all subcategories recursively
                 subcategory_products = []
@@ -83,24 +95,32 @@ class HomepageController:
             
             # Process each main category
             for main_category in main_categories:
-                # Get subcategories
-                subcategories = Category.query.filter_by(
-                    parent_id=main_category.category_id
+                # Get active subcategories
+                subcategories = Category.query.filter(
+                    Category.parent_id == main_category.category_id,
+                    Category.is_active == True
                 ).all()
                 
                 # Get products for main category (excluding products in subcategories and variants)
-                main_category_products = Product.query.filter(
-                    Product.category_id == main_category.category_id,
-                    Product.active_flag == True,
-                    Product.deleted_at == None,
-                    Product.approval_status == 'approved',  # Only get approved products
-                    Product.parent_product_id.is_(None),  # Exclude variants
-                    ~Product.product_id.in_(
-                        db.session.query(Product.product_id)
-                        .join(Category, Product.category_id == Category.category_id)
-                        .filter(Category.parent_id == main_category.category_id)
+                main_category_products = (
+                    Product.query.join(
+                        MerchantProfile, Product.merchant_id == MerchantProfile.id
                     )
-                ).all()
+                    .filter(
+                        MerchantProfile.account_deleted_at.is_(None),
+                        Product.category_id == main_category.category_id,
+                        Product.active_flag == True,
+                        Product.deleted_at == None,
+                        Product.approval_status == 'approved',
+                        Product.parent_product_id.is_(None),
+                        ~Product.product_id.in_(
+                            db.session.query(Product.product_id)
+                            .join(Category, Product.category_id == Category.category_id)
+                            .filter(Category.parent_id == main_category.category_id)
+                        ),
+                    )
+                    .all()
+                )
                 
                 # Get products for each subcategory
                 subcategory_data = []
@@ -138,16 +158,30 @@ class HomepageController:
             }), 500
 
     @staticmethod
-    def get_homepage_carousels(carousel_types=None):
+    def get_homepage_carousels(carousel_types=None, orientation=None):
         """
-        Get all active carousel items for homepage (optionally filter by types).
+        Get all active carousel items for homepage (optionally filter by types and orientation).
         Args:
             carousel_types (list): List of types to filter by ('brand', 'promo', 'new', 'featured')
+            orientation (str): Filter by 'horizontal' or 'vertical'
         Returns:
             list: List of carousel items (dicts)
         """
         try:
             query = Carousel.query.filter_by(is_active=True, deleted_at=None)
+            
+            # Filter by orientation if provided
+            if orientation:
+                # Safely get orientation, default to 'horizontal' if column doesn't exist
+                try:
+                    query = query.filter_by(orientation=orientation)
+                except Exception as e:
+                    logging.warning(f"Could not filter by orientation (column may not exist): {str(e)}")
+                    # If orientation column doesn't exist, only return horizontal by default
+                    if orientation == 'horizontal':
+                        pass  # Return all (backward compatibility)
+                    else:
+                        return []  # Return empty for vertical if column doesn't exist
             
             if carousel_types:
                 # Create a list of conditions for each type
@@ -156,7 +190,36 @@ class HomepageController:
                 query = query.filter(or_(*type_conditions))
             
             items = query.order_by(Carousel.display_order).all()
-            return [item.serialize() for item in items]
+            
+            # Serialize items with error handling for each item
+            result = []
+            for item in items:
+                try:
+                    serialized = item.serialize()
+                    result.append(serialized)
+                except Exception as serialize_error:
+                    logging.error(f"Error serializing carousel item {item.id}: {str(serialize_error)}", exc_info=True)
+                    # Try to create a basic serialization without orientation
+                    try:
+                        basic_serialized = {
+                            'id': item.id,
+                            'type': item.type,
+                            'image_url': item.image_url,
+                            'target_id': item.target_id,
+                            'display_order': item.display_order,
+                            'is_active': item.is_active,
+                            'shareable_link': item.shareable_link,
+                            'orientation': getattr(item, 'orientation', 'horizontal'),  # Default if column doesn't exist
+                            'created_at': item.created_at.isoformat() if item.created_at else None,
+                            'updated_at': item.updated_at.isoformat() if item.updated_at else None
+                        }
+                        result.append(basic_serialized)
+                    except Exception as basic_error:
+                        logging.error(f"Error in basic serialization for carousel {item.id}: {str(basic_error)}", exc_info=True)
+                        # Skip this item if even basic serialization fails
+                        continue
+            
+            return result
         except Exception as e:
-            logging.error(f"Error in get_homepage_carousels: {str(e)}")
+            logging.error(f"Error in get_homepage_carousels: {str(e)}", exc_info=True)
             return [] 

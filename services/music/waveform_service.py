@@ -1,0 +1,187 @@
+# services/music/waveform_service.py
+"""Turn an audio file into a small array of peaks for the trim UI.
+
+Done once at ingest, not on the phone. Computing a waveform client-side is slow on
+cheap Android hardware and, worse, gives a slightly different picture on every
+device — the same song would look different to two merchants.
+
+The output is deliberately tiny: 120 buckets of 3 decimal places is about 600
+bytes, which is cheaper to ship than one extra thumbnail.
+"""
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+
+from flask import current_app
+
+
+DEFAULT_BUCKETS = 120
+# Decode at a reduced rate to keep the Python-side loop small, but NOT so low that
+# the content disappears. Resampling to a few hundred Hz looks tempting — it is a
+# tenth of the samples — but it puts anything above that Nyquist through the
+# resampler's low-pass and deletes it: a 440Hz tone sampled at 400Hz reads as
+# silence, and the waveform comes out flat zero. 8kHz keeps everything up to 4kHz,
+# which is the whole musically-relevant envelope, at ~1.4M samples for a 3 minute
+# track.
+ENVELOPE_HZ = 8000
+
+
+# Where the binaries actually live when PATH cannot be trusted.
+#
+# The systemd unit sets Environment="PATH=/home/ubuntu/Aoin/venv/bin" — the venv
+# and nothing else — so shutil.which() finds neither ffmpeg nor ffprobe even
+# though both are installed at /usr/bin. app.py already works around this for
+# thumbnails; these services did not, and reported perfectly good audio as
+# unplayable.
+_COMMON_BIN_DIRS = ("/usr/bin", "/usr/local/bin", "/bin", "/opt/homebrew/bin")
+
+
+def find_binary(name):
+    """Locate `name` on PATH, then in the usual places. None if genuinely absent."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in _COMMON_BIN_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _ffmpeg_path():
+    return find_binary("ffmpeg") or "ffmpeg"
+
+
+def generate_peaks(audio_path, buckets=DEFAULT_BUCKETS, timeout=120):
+    """Return a list of `buckets` floats in 0..1, or [] if it cannot be produced.
+
+    Never raises. A missing waveform degrades the trim UI to a plain scrub bar,
+    which is worth far less than failing an ingest over.
+    """
+    cmd = [
+        _ffmpeg_path(), "-v", "error",
+        "-i", str(audio_path),
+        "-ac", "1",                          # mono; stereo doubles work for nothing
+        "-ar", str(ENVELOPE_HZ),
+        "-map", "0:a",
+        "-c:a", "pcm_s16le",
+        "-f", "data", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        _log("warning", "waveform: ffmpeg unavailable or timed out: %s", e)
+        return []
+
+    if proc.returncode != 0:
+        _log("warning", "waveform: ffmpeg failed: %s", proc.stderr.decode()[:300])
+        return []
+
+    raw = proc.stdout
+    count = len(raw) // 2
+    if count == 0:
+        return []
+
+    samples = struct.unpack(f"<{count}h", raw[: count * 2])
+    step = max(1, count // buckets)
+
+    peaks = []
+    for i in range(0, count, step):
+        window = samples[i : i + step]
+        if not window:
+            continue
+        peaks.append(round(max(abs(s) for s in window) / 32768.0, 3))
+        if len(peaks) == buckets:
+            break
+
+    # Normalise to the loudest point so a quiet track still fills the bar. Without
+    # this a soft acoustic song renders as a nearly flat line and cannot be trimmed
+    # by eye.
+    loudest = max(peaks) if peaks else 0
+    if loudest > 0:
+        peaks = [round(p / loudest, 3) for p in peaks]
+
+    return peaks
+
+
+def peaks_json(audio_path, buckets=DEFAULT_BUCKETS):
+    return json.dumps(generate_peaks(audio_path, buckets=buckets))
+
+
+def probe_duration_ms(audio_path, timeout=30):
+    """Track length in milliseconds, or 0 if it genuinely cannot be read.
+
+    Tries ffprobe first, then falls back to parsing ffmpeg's own output. They are
+    separate binaries and a box can easily have one without the other — app.py
+    checks for ffmpeg at boot and says nothing about ffprobe, so relying on
+    ffprobe alone made every upload fail with "this does not look like playable
+    audio" on a server where the audio was perfectly fine.
+    """
+    duration = _duration_via_ffprobe(audio_path, timeout)
+    if duration > 0:
+        return duration
+    return _duration_via_ffmpeg(audio_path, timeout)
+
+
+def _duration_via_ffprobe(audio_path, timeout=30):
+    ffprobe = find_binary("ffprobe")
+    if not ffprobe:
+        _log("info", "ffprobe not found; falling back to ffmpeg for duration")
+        return 0
+    cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration",
+           "-of", "csv=p=0", str(audio_path)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if proc.returncode != 0:
+            _log("warning", "ffprobe failed: %s", proc.stderr.decode()[:300])
+            return 0
+        return int(float(proc.stdout.decode().strip()) * 1000)
+    except Exception as e:
+        _log("warning", "ffprobe error: %s", e)
+        return 0
+
+
+def _duration_via_ffmpeg(audio_path, timeout=30):
+    """Read the duration ffmpeg prints to stderr when asked to decode nothing.
+
+    `-f null -` decodes the stream and discards it, which is slower than ffprobe
+    but works with only ffmpeg installed and is exact.
+    """
+    cmd = [_ffmpeg_path(), "-i", str(audio_path), "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except Exception as e:
+        _log("warning", "ffmpeg duration probe failed: %s", e)
+        return 0
+
+    err = proc.stderr.decode(errors="ignore")
+
+    # "time=00:03:21.53" on the final progress line is the decoded length.
+    matches = re.findall(r"time=(\d+):(\d+):(\d+\.?\d*)", err)
+    if matches:
+        h, m, sec = matches[-1]
+        return int((int(h) * 3600 + int(m) * 60 + float(sec)) * 1000)
+
+    # Fall back to the header's "Duration: 00:03:21.53" line.
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", err)
+    if m:
+        h, mi, sec = m.groups()
+        return int((int(h) * 3600 + int(mi) * 60 + float(sec)) * 1000)
+
+    _log("warning", "could not read duration from ffmpeg output: %s", err[-300:])
+    return 0
+
+
+def audio_tooling_available():
+    """Whether anything can measure audio at all. Used to explain failures."""
+    return find_binary("ffmpeg") is not None or find_binary("ffprobe") is not None
+
+
+def _log(level, msg, *args):
+    try:
+        getattr(current_app.logger, level)(msg, *args)
+    except RuntimeError:
+        pass   # no app context (ingest script, shell)

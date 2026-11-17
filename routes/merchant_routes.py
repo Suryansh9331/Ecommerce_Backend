@@ -4,9 +4,12 @@ from controllers.merchant.merchant_settings_controller import MerchantSettingsCo
 from http import HTTPStatus
 from auth.utils import merchant_role_required, super_admin_role_required
 from common.database import db
+from common.db_errors import describe_integrity_error, safe_error_message
+from sqlalchemy.exc import IntegrityError
 import cloudinary
 import cloudinary.uploader
-from werkzeug.exceptions import NotFound
+from werkzeug.exceptions import NotFound, ClientDisconnected, HTTPException
+from services.s3_service import get_s3_service
 from models.product import Product
 from models.product_stock import ProductStock
 from controllers.merchant.brand_request_controller import MerchantBrandRequestController
@@ -18,6 +21,7 @@ from controllers.merchant.product_meta_controller  import MerchantProductMetaCon
 from controllers.merchant.product_tax_controller   import MerchantProductTaxController
 from controllers.merchant.product_shipping_controller import MerchantProductShippingController
 from controllers.merchant.product_media_controller import MerchantProductMediaController
+from controllers.merchant.dimension_preset_controller import MerchantDimensionPresetController
 from controllers.merchant.product_attribute_controller import MerchantProductAttributeController
 from controllers.merchant.product_placement_controller import MerchantProductPlacementController
 from controllers.merchant.tax_category_controller  import MerchantTaxCategoryController
@@ -37,7 +41,11 @@ import logging
 from models.enums import MediaType
 
 
-ALLOWED_MEDIA_EXTENSIONS = {'png', 'jpg', 'jpeg', 'svg', 'gif', 'webp', 'mp4', 'mov', 'avi'}
+# Only allow images - videos removed for now
+ALLOWED_MEDIA_EXTENSIONS = {'png', 'jpg', 'jpeg', 'svg', 'gif', 'webp'}
+
+# File size limits (in bytes)
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB for images
 
 def allowed_media_file(filename):
     """
@@ -603,17 +611,34 @@ def create_product():
         
         # Calculate discount percentage if cost_price and selling_price are provided
         if 'cost_price' in data and 'selling_price' in data:
-            cost_price = float(data['cost_price'])
-            selling_price = float(data['selling_price'])
+            try:
+                cost_price = float(data['cost_price'])
+                selling_price = float(data['selling_price'])
+            except (TypeError, ValueError):
+                return jsonify({
+                    'message': 'Cost price and selling price must be valid numbers.',
+                    'error': 'Cost price and selling price must be valid numbers.'
+                }), HTTPStatus.BAD_REQUEST
             data['discount_pct'] = calculate_discount_percentage(cost_price, selling_price)
-        
+
         p = MerchantProductController.create(data)
         return jsonify(p.serialize()), HTTPStatus.CREATED
+    except HTTPException:
+        # abort(404, "Merchant profile not found") etc. — keep the real status/message.
+        raise
     except ValueError as e:
-        return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
+        # Validation / duplicate-SKU style problems the merchant can fix themselves.
+        return jsonify({'message': str(e), 'error': str(e)}), HTTPStatus.BAD_REQUEST
+    except IntegrityError as e:
+        db.session.rollback()
+        message, status = describe_integrity_error(e, entity='product')
+        current_app.logger.warning(f"Product create rejected (constraint): {message}")
+        return jsonify({'message': message, 'error': message}), status
     except Exception as e:
-        current_app.logger.error(f"Error creating product: {e}")
-        return jsonify({'message': 'Failed to create product'}), HTTPStatus.INTERNAL_SERVER_ERROR
+        db.session.rollback()
+        current_app.logger.error(f"Error creating product: {e}", exc_info=True)
+        message = f"Failed to create product: {safe_error_message(e)}"
+        return jsonify({'message': message, 'error': message}), HTTPStatus.INTERNAL_SERVER_ERROR
 
 @merchant_dashboard_bp.route('/products/<int:pid>/variants', methods=['POST'])
 @merchant_role_required
@@ -735,6 +760,151 @@ def create_product_variant(pid):
 
         variant = MerchantProductController.create_variant(pid, data)
         return jsonify(variant.serialize()), HTTPStatus.CREATED
+    except ValueError as e:
+        return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
+    except Exception as e:
+        current_app.logger.error(f"Error creating product variant: {e}")
+        return jsonify({'message': 'Failed to create variant'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+@merchant_dashboard_bp.route('/products/<int:pid>/size-quantities', methods=['POST'])
+@merchant_role_required
+def bulk_create_size_variants(pid):
+    """
+    Bulk create size-based variants for a product
+    ---
+    tags:
+      - Merchant - Products
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: pid
+        type: integer
+        required: true
+        description: Parent product ID
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - size_quantities
+            properties:
+              size_quantities:
+                type: array
+                description: Array of size-quantity pairs
+                items:
+                  type: object
+                  required:
+                    - size
+                    - quantity
+                  properties:
+                    size:
+                      type: string
+                      description: Size value (e.g., S, M, L, XL)
+                    quantity:
+                      type: integer
+                      minimum: 0
+                      description: Stock quantity for this size
+              low_stock_threshold:
+                type: integer
+                minimum: 0
+                description: Low stock threshold (defaults to parent's threshold)
+    responses:
+      201:
+        description: Size variants created successfully
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+            variants:
+              type: array
+              items:
+                type: object
+      400:
+        description: Invalid request data or variants already exist
+      404:
+        description: Parent product not found or Size attribute not found
+      500:
+        description: Internal server error
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'message': 'No data provided'}), HTTPStatus.BAD_REQUEST
+
+        # Validate required fields
+        if 'size_quantities' not in data:
+            return jsonify({
+                'message': 'Missing required field: size_quantities',
+                'error': 'MISSING_FIELDS'
+            }), HTTPStatus.BAD_REQUEST
+
+        if not isinstance(data['size_quantities'], list) or len(data['size_quantities']) == 0:
+            return jsonify({
+                'message': 'size_quantities must be a non-empty array',
+                'error': 'INVALID_DATA'
+            }), HTTPStatus.BAD_REQUEST
+
+        # Validate each size-quantity pair
+        for sq in data['size_quantities']:
+            if 'size' not in sq or 'quantity' not in sq:
+                return jsonify({
+                    'message': 'Each size-quantity pair must have "size" and "quantity"',
+                    'error': 'INVALID_DATA'
+                }), HTTPStatus.BAD_REQUEST
+            
+            try:
+                sq['quantity'] = int(sq['quantity'])
+                if sq['quantity'] < 0:
+                    return jsonify({
+                        'message': 'Quantity cannot be negative',
+                        'error': 'INVALID_QUANTITY'
+                    }), HTTPStatus.BAD_REQUEST
+            except (ValueError, TypeError):
+                return jsonify({
+                    'message': 'Quantity must be a valid integer',
+                    'error': 'INVALID_QUANTITY'
+                }), HTTPStatus.BAD_REQUEST
+
+        # Check for duplicate sizes
+        sizes = [sq['size'].strip().lower() for sq in data['size_quantities']]
+        if len(sizes) != len(set(sizes)):
+            return jsonify({
+                'message': 'Duplicate sizes are not allowed',
+                'error': 'DUPLICATE_SIZES'
+            }), HTTPStatus.BAD_REQUEST
+
+        # Validate low_stock_threshold if provided
+        low_stock_threshold = None
+        if 'low_stock_threshold' in data:
+            try:
+                low_stock_threshold = int(data['low_stock_threshold'])
+                if low_stock_threshold < 0:
+                    return jsonify({
+                        'message': 'Low stock threshold cannot be negative',
+                        'error': 'INVALID_THRESHOLD'
+                    }), HTTPStatus.BAD_REQUEST
+            except (ValueError, TypeError):
+                return jsonify({
+                    'message': 'Low stock threshold must be a valid integer',
+                    'error': 'INVALID_THRESHOLD'
+                }), HTTPStatus.BAD_REQUEST
+
+        result = MerchantProductController.bulk_create_size_variants(
+            pid, 
+            data['size_quantities'],
+            low_stock_threshold
+        )
+        return jsonify(result), HTTPStatus.CREATED
+
+    except ValueError as e:
+        return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
+    except Exception as e:
+        current_app.logger.error(f"Error creating size variants: {e}")
+        return jsonify({'message': 'Failed to create size variants'}), HTTPStatus.INTERNAL_SERVER_ERROR
 
     except ValueError as e:
         return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
@@ -1409,6 +1579,219 @@ def upsert_product_shipping(pid):
     s = MerchantProductShippingController.upsert(pid, data)
     return jsonify(s.serialize()), 200
 
+# DIMENSION PRESETS
+@merchant_dashboard_bp.route('/dimension-presets', methods=['GET'])
+@merchant_role_required
+@jwt_required()
+def list_dimension_presets():
+    """
+    Get all dimension presets for the current merchant
+    ---
+    tags:
+      - Merchant - Dimension Presets
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: List of dimension presets retrieved successfully
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              preset_id:
+                type: integer
+              merchant_id:
+                type: integer
+              name:
+                type: string
+              length_cm:
+                type: number
+              width_cm:
+                type: number
+              height_cm:
+                type: number
+              weight_kg:
+                type: number
+              shipping_class:
+                type: string
+              description:
+                type: string
+              created_at:
+                type: string
+              updated_at:
+                type: string
+      500:
+        description: Internal server error
+    """
+    presets = MerchantDimensionPresetController.list_all()
+    return jsonify([preset.serialize() for preset in presets]), 200
+
+@merchant_dashboard_bp.route('/dimension-presets/<int:preset_id>', methods=['GET'])
+@merchant_role_required
+@jwt_required()
+def get_dimension_preset(preset_id):
+    """
+    Get a specific dimension preset by ID
+    ---
+    tags:
+      - Merchant - Dimension Presets
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: preset_id
+        type: integer
+        required: true
+        description: Dimension preset ID
+    responses:
+      200:
+        description: Dimension preset retrieved successfully
+      404:
+        description: Preset not found
+      500:
+        description: Internal server error
+    """
+    preset = MerchantDimensionPresetController.get(preset_id)
+    return jsonify(preset.serialize()), 200
+
+@merchant_dashboard_bp.route('/dimension-presets', methods=['POST'])
+@merchant_role_required
+@jwt_required()
+def create_dimension_preset():
+    """
+    Create a new dimension preset
+    ---
+    tags:
+      - Merchant - Dimension Presets
+    security:
+      - Bearer: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - name
+              - length_cm
+              - width_cm
+              - height_cm
+              - weight_kg
+            properties:
+              name:
+                type: string
+                description: Name of the dimension preset
+              length_cm:
+                type: number
+                description: Length in centimeters
+              width_cm:
+                type: number
+                description: Width in centimeters
+              height_cm:
+                type: number
+                description: Height in centimeters
+              weight_kg:
+                type: number
+                description: Weight in kilograms
+              shipping_class:
+                type: string
+                description: Shipping class (optional)
+              description:
+                type: string
+                description: Optional description
+    responses:
+      201:
+        description: Dimension preset created successfully
+      400:
+        description: Invalid request data
+      500:
+        description: Internal server error
+    """
+    data = request.get_json()
+    preset = MerchantDimensionPresetController.create(data)
+    return jsonify(preset.serialize()), 201
+
+@merchant_dashboard_bp.route('/dimension-presets/<int:preset_id>', methods=['PUT'])
+@merchant_role_required
+@jwt_required()
+def update_dimension_preset(preset_id):
+    """
+    Update an existing dimension preset
+    ---
+    tags:
+      - Merchant - Dimension Presets
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: preset_id
+        type: integer
+        required: true
+        description: Dimension preset ID
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              name:
+                type: string
+              length_cm:
+                type: number
+              width_cm:
+                type: number
+              height_cm:
+                type: number
+              weight_kg:
+                type: number
+              shipping_class:
+                type: string
+              description:
+                type: string
+    responses:
+      200:
+        description: Dimension preset updated successfully
+      400:
+        description: Invalid request data
+      404:
+        description: Preset not found
+      500:
+        description: Internal server error
+    """
+    data = request.get_json()
+    preset = MerchantDimensionPresetController.update(preset_id, data)
+    return jsonify(preset.serialize()), 200
+
+@merchant_dashboard_bp.route('/dimension-presets/<int:preset_id>', methods=['DELETE'])
+@merchant_role_required
+@jwt_required()
+def delete_dimension_preset(preset_id):
+    """
+    Delete a dimension preset (soft delete)
+    ---
+    tags:
+      - Merchant - Dimension Presets
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: preset_id
+        type: integer
+        required: true
+        description: Dimension preset ID
+    responses:
+      200:
+        description: Dimension preset deleted successfully
+      404:
+        description: Preset not found
+      500:
+        description: Internal server error
+    """
+    preset = MerchantDimensionPresetController.delete(preset_id)
+    return jsonify({'message': 'Dimension preset deleted successfully', 'preset': preset.serialize()}), 200
+
 # PRODUCT MEDIA
 @merchant_dashboard_bp.route('/products/<int:pid>/media', methods=['GET'])
 @merchant_role_required
@@ -1605,86 +1988,312 @@ def create_product_media(pid):
             message:
               type: string
     """
-    if 'media_file' not in request.files:
-        return jsonify({'message': 'No media file part in the request'}), HTTPStatus.BAD_REQUEST
-    
-    file = request.files['media_file']
-
-    if file.filename == '':
-        return jsonify({'message': 'No selected file'}), HTTPStatus.BAD_REQUEST
-
-    
-    if not allowed_media_file(file.filename):
-        return jsonify({'message': f"Invalid file type. Allowed types: {', '.join(ALLOWED_MEDIA_EXTENSIONS)}"}), HTTPStatus.BAD_REQUEST
-
-  
-    file_mimetype = file.mimetype.lower()
-    media_type_str = "IMAGE" 
-    if file_mimetype.startswith('video/'):
-        media_type_str = "VIDEO"
-    elif not file_mimetype.startswith('image/'):
-       
-        return jsonify({'message': f"Unsupported file content type: {file.mimetype}"}), HTTPStatus.BAD_REQUEST
-
-   
-    media_type_from_form = request.form.get('type', media_type_str).upper()
-
-
-    sort_order_str = request.form.get('sort_order', '0')
     try:
-        sort_order = int(sort_order_str)
-    except ValueError:
-        return jsonify({'message': 'Invalid sort_order format, must be an integer.'}), HTTPStatus.BAD_REQUEST
-    
-   
-   
-    cloudinary_url = None
-    cloudinary_public_id = None 
-    resource_type_for_cloudinary = "image" if media_type_from_form == "IMAGE" else "video"
-
-    try:
+        # ========== STAGE 1: REQUEST RECEIVED ==========
+        print("=" * 80)
+        print(f"[STAGE 1] ========== MEDIA UPLOAD REQUEST RECEIVED ==========")
+        print(f"[STAGE 1] POST /products/{pid}/media: Request received")
+        print(f"[STAGE 1] Content-Type: {request.content_type}")
+        print(f"[STAGE 1] Content-Length: {request.content_length}")
+        print(f"[STAGE 1] Request method: {request.method}")
+        print(f"[STAGE 1] Request path: {request.path}")
+        print(f"[STAGE 1] Remote address: {request.remote_addr}")
+        print(f"[STAGE 1] Headers: {dict(request.headers)}")
+        print("=" * 80)
+        current_app.logger.info(f"[STAGE 1] Request received for product {pid}")
         
-        upload_result = cloudinary.uploader.upload(
-            file,
-            folder=f"product_media/{pid}",  
-            resource_type=resource_type_for_cloudinary
-        )
-        cloudinary_url = upload_result.get('secure_url')
-        cloudinary_public_id = upload_result.get('public_id') 
+        # STEP 1: Validate file size BEFORE parsing (to avoid ClientDisconnected and provide clear errors)
+        # Check Content-Length header first - this doesn't trigger multipart parsing
+        content_length = request.content_length
+        if content_length is None:
+            print(f"[STAGE 1] ERROR: No Content-Length header")
+            current_app.logger.warning(f"POST /products/{pid}/media: No Content-Length header")
+            return jsonify({
+                'message': 'File size could not be determined. Please ensure the file is being sent correctly.',
+                'error_type': 'MissingContentLength'
+            }), HTTPStatus.BAD_REQUEST
+        
+        # Convert to MB for user-friendly messages
+        file_size_mb = content_length / (1024 * 1024)
+        print(f"[STAGE 1] File size validated: {file_size_mb:.2f} MB ({content_length} bytes)")
+        current_app.logger.info(f"[STAGE 1] File size: {file_size_mb:.2f} MB")
+        
+        # Initial check: reject if larger than image limit (only images are supported)
+        if content_length > MAX_IMAGE_SIZE:
+            print(f"[STAGE 1] ERROR: File too large")
+            current_app.logger.error(f"POST /products/{pid}/media: File too large: {file_size_mb:.2f} MB (max: {MAX_IMAGE_SIZE / (1024 * 1024):.0f} MB)")
+            return jsonify({
+                'message': f'File is too large ({file_size_mb:.2f} MB). Maximum allowed size is {MAX_IMAGE_SIZE / (1024 * 1024):.0f} MB for images.',
+                'error_type': 'FileTooLarge',
+                'file_size_mb': round(file_size_mb, 2),
+                'max_size_mb': MAX_IMAGE_SIZE / (1024 * 1024)
+            }), HTTPStatus.BAD_REQUEST
+        
+        print(f"[STAGE 1] File size check PASSED - proceeding to parse multipart data")
+        
+        # ========== STAGE 2: PARSE MULTIPART FORM DATA ==========
+        print(f"[STAGE 2] Starting multipart form data parsing...")
+        current_app.logger.info(f"[STAGE 2] Attempting to parse multipart form data")
+        
+        # IMPORTANT: Accessing request.files triggers multipart parsing which can cause ClientDisconnected
+        # if the client closes the connection during parsing. We need to handle this gracefully.
+        # NOTE: Cloudinary uses the same approach (request.files['image']) and it works fine,
+        # so the issue might be timing or how we access it. Let's try direct access like Cloudinary.
+        try:
+            print(f"[STAGE 2] Accessing request.files - this will trigger parsing...")
+            print(f"[STAGE 2] Using direct access like Cloudinary does (request.files['media_file'])...")
+            
+            # Try direct access first (like Cloudinary does) - this is more efficient
+            if 'media_file' not in request.files:
+                print(f"[STAGE 2] ERROR: 'media_file' not in request.files")
+                available_keys = list(request.files.keys()) if request.files else []
+                print(f"[STAGE 2] Available keys: {available_keys}")
+                current_app.logger.error(f"POST /products/{pid}/media: No media_file in request. Available keys: {available_keys}")
+                return jsonify({
+                    'message': 'No media_file in the request',
+                    'available_keys': available_keys
+                }), HTTPStatus.BAD_REQUEST
+            
+            # Direct access like Cloudinary (more efficient than .get())
+            print(f"[STAGE 2] Getting file with direct access: request.files['media_file']...")
+            file = request.files['media_file']
+            print(f"[STAGE 2] Direct access completed. File object: {file}")
+            
+            if not file:
+                # Check what files are available for debugging
+                available_keys = list(request.files.keys()) if request.files else []
+                current_app.logger.error(f"POST /products/{pid}/media: No media_file in request. Available keys: {available_keys}")
+                return jsonify({
+                    'message': 'No media_file in the request',
+                    'available_keys': available_keys
+                }), HTTPStatus.BAD_REQUEST
+            
+            print(f"[DEBUG] Successfully got file: {file.filename}")
+            
+        except ClientDisconnected as e:
+            current_app.logger.error(f"Client disconnected while parsing form data: {e}")
+            return jsonify({
+                'message': 'Upload failed: Connection was closed during file upload. This may be due to network issues, timeout, or the file being too large. Please try again with a smaller file or check your network connection.',
+                'error_type': 'ClientDisconnected',
+                'error_details': 'The client disconnected while the server was reading the file. This usually indicates a network issue or timeout.'
+            }), HTTPStatus.BAD_REQUEST
+        except Exception as parse_error:
+            # Catch any other parsing errors
+            error_type = type(parse_error).__name__
+            current_app.logger.error(f"Error parsing form data: {error_type}: {parse_error}", exc_info=True)
+            if 'ClientDisconnected' in error_type or 'Disconnected' in error_type:
+                return jsonify({
+                    'message': 'Upload failed: Connection was closed during file upload.',
+                    'error_type': error_type,
+                    'error_details': str(parse_error)
+                }), HTTPStatus.BAD_REQUEST
+            raise
 
-        if not cloudinary_url:
-            current_app.logger.error("Cloudinary upload for product media succeeded but no secure_url was returned.")
-            return jsonify({'message': 'Cloudinary upload succeeded but did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
+        if file.filename == '':
+            current_app.logger.error(f"POST /products/{pid}/media: Empty filename")
+            return jsonify({'message': 'No selected file'}), HTTPStatus.BAD_REQUEST
+        
+        # STEP 3: Validate file type - only images are allowed
+        file_mimetype = file.mimetype.lower() if file.mimetype else ''
+        file_ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+        
+        # Reject videos explicitly
+        if file_mimetype.startswith('video/') or file_ext in ['mp4', 'mov', 'avi', 'mkv', 'webm']:
+            current_app.logger.error(f"POST /products/{pid}/media: Video files are not supported. File: {file.filename}")
+            return jsonify({
+                'message': 'Video files are not supported. Please upload only images (PNG, JPG, JPEG, GIF, WebP, SVG).',
+                'error_type': 'InvalidFileType',
+                'file_type': 'video',
+                'filename': file.filename
+            }), HTTPStatus.BAD_REQUEST
+        
+        # Validate file size for images
+        content_length = request.content_length
+        file_size_mb = content_length / (1024 * 1024) if content_length else 0
+        
+        if content_length and content_length > MAX_IMAGE_SIZE:
+            current_app.logger.error(f"POST /products/{pid}/media: Image file too large: {file_size_mb:.2f} MB (max: {MAX_IMAGE_SIZE / (1024 * 1024):.0f} MB)")
+            return jsonify({
+                'message': f'Image file is too large ({file_size_mb:.2f} MB). Maximum allowed size is {MAX_IMAGE_SIZE / (1024 * 1024):.0f} MB.',
+                'error_type': 'FileTooLarge',
+                'file_type': 'image',
+                'file_size_mb': round(file_size_mb, 2),
+                'max_size_mb': MAX_IMAGE_SIZE / (1024 * 1024),
+                'filename': file.filename
+            }), HTTPStatus.BAD_REQUEST
+        
+        current_app.logger.info(f"POST /products/{pid}/media: Processing image file: {file.filename}, size: {file_size_mb:.2f} MB, mimetype: {file.mimetype}")
+
+        
+        if not allowed_media_file(file.filename):
+            file_ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else 'no extension'
+            current_app.logger.error(f"POST /products/{pid}/media: Invalid file extension '{file_ext}' for file: {file.filename}. Allowed: {ALLOWED_MEDIA_EXTENSIONS}")
+            return jsonify({
+                'message': f"Invalid file type. Allowed types: {', '.join(sorted(ALLOWED_MEDIA_EXTENSIONS))}",
+                'received_extension': file_ext,
+                'filename': file.filename
+            }), HTTPStatus.BAD_REQUEST
+
+        # Only images are supported - set media type to IMAGE
+        media_type_str = "IMAGE"
+        
+        # Ensure mimetype is set correctly for images
+        if not file_mimetype.startswith('image/'):
+            file_ext = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+            if file_ext in ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']:
+                # Set appropriate mimetype based on extension
+                if file_ext == 'png':
+                    file.mimetype = 'image/png'
+                elif file_ext in ['jpg', 'jpeg']:
+                    file.mimetype = 'image/jpeg'
+                elif file_ext == 'gif':
+                    file.mimetype = 'image/gif'
+                elif file_ext == 'webp':
+                    file.mimetype = 'image/webp'
+                elif file_ext == 'svg':
+                    file.mimetype = 'image/svg+xml'
+            else:
+                current_app.logger.error(f"Unsupported file content type: {file.mimetype} for file: {file.filename}")
+                return jsonify({'message': f"Unsupported file type. Only images are allowed (PNG, JPG, JPEG, GIF, WebP, SVG). File: {file.filename}"}), HTTPStatus.BAD_REQUEST
+
+       
+        # Ensure media type is always IMAGE (videos are not supported)
+        media_type_from_form = request.form.get('type', media_type_str).upper()
+        if media_type_from_form != 'IMAGE':
+            # Force to IMAGE if somehow VIDEO was passed
+            media_type_from_form = 'IMAGE'
+
+
+        sort_order_str = request.form.get('sort_order', '0')
+        try:
+            sort_order = int(sort_order_str)
+        except ValueError:
+            return jsonify({'message': 'Invalid sort_order format, must be an integer.'}), HTTPStatus.BAD_REQUEST
+        
+       
+       
+        # ========== STAGE 3: PREPARE FOR S3 UPLOAD ==========
+        print(f"[STAGE 3] Preparing for S3 upload...")
+        current_app.logger.info(f"[STAGE 3] Starting S3 upload preparation")
+        
+        # Use S3 for product images
+        s3_upload_result = None
+        media_url = None
+        s3_key = None 
+        
+        # Upload images to S3
+        try:
+            print(f"[STAGE 3] Getting S3 service...")
+            s3_service = get_s3_service()
+            print(f"[STAGE 3] S3 service obtained. Bucket: {s3_service.bucket_name if hasattr(s3_service, 'bucket_name') else 'N/A'}")
+            current_app.logger.info(f"[STAGE 3] S3 service initialized")
+            
+            print(f"[STAGE 3] Calling s3_service.upload_product_media()...")
+            print(f"[STAGE 3] File object before upload: filename={file.filename}, type={type(file)}")
+            current_app.logger.info(f"[STAGE 3] Starting S3 upload for file: {file.filename}")
+            
+            s3_upload_result = s3_service.upload_product_media(file, pid)
+            
+            print(f"[STAGE 3] S3 upload completed. Result: {s3_upload_result}")
+            current_app.logger.info(f"[STAGE 3] S3 upload successful")
+            
+            print(f"[STAGE 3] S3 upload result received: {s3_upload_result}")
+            
+            if not s3_upload_result or not s3_upload_result.get('url'):
+                print(f"[STAGE 3] ERROR: S3 upload succeeded but no URL returned")
+                current_app.logger.error(f"S3 upload for product {media_type_from_form.lower()} succeeded but no URL was returned.")
+                return jsonify({'message': 'S3 upload succeeded but did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
+            
+            # Store S3 key in public_id field for deletion later
+            s3_key = s3_upload_result.get('s3_key')
+            media_url = s3_upload_result.get('url')
+            print(f"[STAGE 3] S3 key: {s3_key}")
+            print(f"[STAGE 3] Media URL: {media_url}")
+            current_app.logger.info(f"[STAGE 3] S3 upload successful. Key: {s3_key}, URL: {media_url}")
+            
+        except Exception as e:
+            error_message = str(e)
+            current_app.logger.error(f"S3 upload failed for product {media_type_from_form.lower()} (product {pid}): {error_message}", exc_info=True)
+            # Return detailed error message to help with debugging
+            return jsonify({
+                'message': f"S3 {media_type_from_form.lower()} upload failed: {error_message}",
+                'error_details': error_message,
+                'file_name': file.filename if file else 'unknown'
+            }), HTTPStatus.INTERNAL_SERVER_ERROR
+
+        # ========== STAGE 4: SAVE TO DATABASE ==========
+        print(f"[STAGE 4] Saving media to database...")
+        current_app.logger.info(f"[STAGE 4] Preparing to save media to database")
+       
+        media_data = {
+            'url': media_url,
+            'type': media_type_from_form, 
+            'sort_order': sort_order,
+                'public_id': s3_key  # Store S3 key for images
+        }
+        print(f"[STAGE 4] Media data: {media_data}")
+
+       
+        try:
+            print(f"[STAGE 4] Calling MerchantProductMediaController.create()...")
+            new_media = MerchantProductMediaController.create(pid, media_data)
+            print(f"[STAGE 4] SUCCESS: Media saved to database. Media ID: {new_media.id if hasattr(new_media, 'id') else 'N/A'}")
+            current_app.logger.info(f"[STAGE 4] Media successfully saved to database")
+            
+            print(f"[STAGE 4] Returning success response...")
+            return jsonify(new_media.serialize()), HTTPStatus.CREATED
+        except ValueError as e: 
+            # If DB save fails, delete uploaded file from S3
+            if s3_upload_result:
+                try:
+                    get_s3_service().delete_product_media(s3_upload_result.get('s3_key'))
+                except Exception:
+                    pass  # Logged in delete function
+            return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
+        except RuntimeError as e: 
+            # If DB save fails, delete uploaded file from S3
+            if s3_upload_result:
+                try:
+                    get_s3_service().delete_product_media(s3_upload_result.get('s3_key'))
+                except Exception:
+                    pass  # Logged in delete function
+            return jsonify({'message': str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+        except Exception as e:
+            db.session.rollback() 
+            current_app.logger.error(f"Error saving product media to DB for product {pid}: {e}")
+            # If DB save fails, delete uploaded file from S3
+            if s3_upload_result:
+                try:
+                    get_s3_service().delete_product_media(s3_upload_result.get('s3_key'))
+                except Exception:
+                    pass  # Logged in delete function
+            return jsonify({'message': 'Failed to save product media information.'}), HTTPStatus.INTERNAL_SERVER_ERROR
     
-    except cloudinary.exceptions.Error as e:
-        current_app.logger.error(f"Cloudinary upload failed for product media (product {pid}): {e}")
-        return jsonify({'message': f"Cloudinary media upload failed: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
     except Exception as e:
-        current_app.logger.error(f"Error during product media file upload (product {pid}): {e}")
-        return jsonify({'message': f"An error occurred during media file upload: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
-
-   
-    media_data = {
-        'url': cloudinary_url,
-        'type': media_type_from_form, 
-        'sort_order': sort_order,
-       
-    }
-
-   
-    try:
-       
-        new_media = MerchantProductMediaController.create(pid, media_data)
-        return jsonify(new_media.serialize()), HTTPStatus.CREATED
-    except ValueError as e: 
-        return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
-    except RuntimeError as e: 
-        return jsonify({'message': str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
-    except Exception as e:
-        db.session.rollback() 
-        current_app.logger.error(f"Error saving product media to DB for product {pid}: {e}")
-       
-        return jsonify({'message': 'Failed to save product media information.'}), HTTPStatus.INTERNAL_SERVER_ERROR
+        # Catch any unexpected errors that weren't handled above
+        error_message = str(e)
+        error_type = type(e).__name__
+        import traceback
+        error_trace = traceback.format_exc()
+        
+        print(f"[ERROR] Unexpected error in create_product_media: {error_type}: {error_message}")
+        print(f"[ERROR] Traceback:\n{error_trace}")
+        
+        current_app.logger.error(f"Unexpected error in create_product_media for product {pid}: {error_type}: {error_message}", exc_info=True)
+        
+        # Handle ClientDisconnected specially - this usually means the client closed the connection
+        if error_type == 'ClientDisconnected':
+            return jsonify({
+                'message': 'Upload failed: Connection was closed before the file could be uploaded. Please try again with a smaller file or check your network connection.',
+                'error_type': error_type,
+                'error_details': 'The client disconnected during file upload. This may be due to network issues, file size, or timeout.'
+            }), HTTPStatus.BAD_REQUEST
+        
+        return jsonify({
+            'message': f'An unexpected error occurred: {error_message}',
+            'error_type': error_type,
+            'error_details': error_message
+        }), HTTPStatus.INTERNAL_SERVER_ERROR
 
 
 @merchant_dashboard_bp.route('/products/media/<int:mid>', methods=['DELETE'])
@@ -4704,7 +5313,14 @@ def start_merchant_live_stream(stream_id):
                     'Authorization': f'Bearer {access_token}',
                     'Accept': 'application/json'
                 }
-                resp = requests.post(url, headers=headers, params=params)
+                try:
+                    resp = requests.post(url, headers=headers, params=params, timeout=10)
+                except requests.exceptions.Timeout:
+                    current_app.logger.error(f"External API timeout: {url}")
+                    raise Exception(f'YouTube API timeout: Request timed out after 10 seconds')
+                except requests.exceptions.RequestException as e:
+                    current_app.logger.error(f"External API error: {url} - {str(e)}")
+                    raise Exception(f'YouTube API error: {str(e)}')
                 if resp.status_code != 200:
                     # Check for redundantTransition error
                     try:
@@ -4925,44 +5541,4 @@ def set_product_size_quantities(pid):
         db.session.rollback()
         current_app.logger.exception("Failed to save size quantities")
         return jsonify({'message': f'Failed to save size quantities: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
-
-
-# -----------------------------------------------------------------------------
-# Merchant invoice download: renders the GST tax invoice PDF for the merchant's
-# own items in a given order. Reuses the invoice helper from order_routes and
-# scopes items to the current merchant.
-# -----------------------------------------------------------------------------
-@merchant_dashboard_bp.route('/orders/<string:order_id>/invoice.pdf', methods=['GET'])
-@merchant_role_required
-def merchant_download_invoice(order_id):
-    from flask import send_file, abort
-    from io import BytesIO
-    from models.order import Order, OrderItem
-    from routes.order_routes import _build_invoice_pdf_for_order
-
-    user_id = get_jwt_identity()
-    merchant = MerchantProfile.get_by_user_id(user_id)
-    if not merchant:
-        return jsonify({'message': 'Merchant profile not found'}), HTTPStatus.NOT_FOUND
-
-    order = Order.query.filter_by(order_id=order_id).first()
-    if not order:
-        return jsonify({'message': 'Order not found'}), HTTPStatus.NOT_FOUND
-
-    items = OrderItem.query.filter_by(order_id=order_id, merchant_id=merchant.id).all()
-    if not items:
-        return jsonify({'message': 'No line items for this merchant in this order'}), HTTPStatus.NOT_FOUND
-
-    try:
-        pdf_bytes = _build_invoice_pdf_for_order(order, items)
-    except Exception as e:
-        current_app.logger.exception("Merchant invoice render failed")
-        return jsonify({'message': f'Failed to generate invoice: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
-
-    return send_file(
-        BytesIO(pdf_bytes),
-        mimetype='application/pdf',
-        as_attachment=False,
-        download_name=f"invoice-{order_id}.pdf",
-    )
 

@@ -1,0 +1,72 @@
+"""Twilio service for sending OTP SMS messages."""
+import re
+from flask import current_app
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+
+
+def _is_apple_review_test_phone(phone_e164: str) -> bool:
+    if not phone_e164:
+        return False
+    digits = re.sub(r"\D", "", str(phone_e164))
+    if len(digits) < 10:
+        return False
+    last10 = digits[-10:]
+    return re.match(r"^(\d)\1{4}(\d)\2{4}$", last10) is not None
+
+
+def send_otp_sms(phone_number, otp_code):
+    """
+    Send OTP code via SMS using Twilio.
+    
+    Args:
+        phone_number (str): Phone number in E.164 format (e.g., +1234567890)
+        otp_code (str): 6-digit OTP code to send
+        
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    try:
+        # Apple review bypass: skip Twilio for specific "test numbers"
+        if current_app.config.get("APPLE_REVIEW_OTP_BYPASS") and _is_apple_review_test_phone(phone_number):
+            current_app.logger.warning(
+                f"[APPLE_REVIEW_OTP_BYPASS] Skipping SMS for {phone_number}. OTP: {otp_code}"
+            )
+            return True, "OTP bypassed for Apple review"
+
+        # Dev bypass: skip Twilio and return OTP directly
+        if current_app.config.get('DEV_OTP_BYPASS'):
+            current_app.logger.warning(f"[DEV_OTP_BYPASS] OTP for {phone_number}: {otp_code}")
+            return True, f"dev_otp:{otp_code}"
+
+        account_sid = current_app.config.get('TWILIO_ACCOUNT_SID')
+        auth_token = current_app.config.get('TWILIO_AUTH_TOKEN')
+        from_number = current_app.config.get('TWILIO_PHONE_NUMBER')
+
+        if not all([account_sid, auth_token, from_number]):
+            current_app.logger.error("Twilio credentials not configured")
+            return False, "SMS service not configured"
+
+        # Initialize Twilio client
+        client = Client(account_sid, auth_token)
+        
+        # Create SMS message
+        message_body = f"Your AOIN verification code is: {otp_code}. This code will expire in 10 minutes."
+        
+        # Send SMS
+        message = client.messages.create(
+            body=message_body,
+            from_=from_number,
+            to=phone_number
+        )
+        
+        current_app.logger.info(f"OTP SMS sent to {phone_number}. Message SID: {message.sid}")
+        return True, "OTP sent successfully"
+        
+    except TwilioRestException as e:
+        current_app.logger.error(f"Twilio error sending SMS to {phone_number}: {str(e)}")
+        return False, f"Failed to send SMS: {str(e)}"
+    except Exception as e:
+        current_app.logger.error(f"Unexpected error sending SMS to {phone_number}: {str(e)}")
+        return False, f"Failed to send SMS: {str(e)}"
+

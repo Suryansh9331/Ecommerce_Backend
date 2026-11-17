@@ -1,9 +1,9 @@
 import bcrypt
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 import re
-from datetime import datetime, timezone
+from sqlalchemy import TypeDecorator, String, Enum as SQLEnum
 
 from common.database import db, BaseModel
 from auth.models.merchant_document import VerificationStatus, DocumentType
@@ -15,11 +15,51 @@ class UserRole(Enum):
     MERCHANT = 'merchant'
     ADMIN = 'admin'
     SUPER_ADMIN = 'super_admin'
+    CREATOR = 'creator'
 
 class AuthProvider(Enum):
     LOCAL = 'local'
     GOOGLE = 'google'
+    PHONE = 'phone'
     # Can add other providers later (Facebook, Apple, etc.)
+
+class AuthProviderType(TypeDecorator):
+    """Custom type to handle AuthProvider enum conversion."""
+    impl = String(50)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        """Convert enum to string value when storing."""
+        if value is None:
+            return None
+        if isinstance(value, AuthProvider):
+            return value.value
+        if isinstance(value, str):
+            # Try to validate it's a valid enum value
+            try:
+                return AuthProvider(value).value
+            except ValueError:
+                return value.lower()  # Normalize to lowercase
+        return str(value).lower()
+
+    def process_result_value(self, value, dialect):
+        """Convert string value to enum when reading."""
+        if value is None:
+            return None
+        try:
+            # Try exact match first
+            return AuthProvider(value)
+        except ValueError:
+            try:
+                # Try case-insensitive match
+                value_lower = value.lower() if value else None
+                for provider in AuthProvider:
+                    if provider.value.lower() == value_lower:
+                        return provider
+            except (ValueError, TypeError, AttributeError):
+                pass
+        # Fallback to LOCAL if invalid
+        return AuthProvider.LOCAL
 
 class User(BaseModel):
     """User model for all types of users (customers, merchants, admins)."""
@@ -31,22 +71,26 @@ class User(BaseModel):
     first_name = db.Column(db.String(100), nullable=False)
     last_name = db.Column(db.String(100), nullable=False)
     phone = db.Column(db.String(20), nullable=True)
+    date_of_birth = db.Column(db.Date, nullable=True)  # Date of birth (optional)
+    gender = db.Column(db.String(20), nullable=True)  # Gender: 'male', 'female', 'other', 'prefer_not_to_say'
     profile_img = db.Column(db.String(512), nullable=True)  # URL for Cloudinary profile image
-    role = db.Column(db.Enum(UserRole), default=UserRole.USER, nullable=False)
+    # Use enum values ('user', 'super_admin', etc.) in DB so existing data and migrations match
+    role = db.Column(
+        SQLEnum(UserRole, values_callable=lambda obj: [e.value for e in obj], name="userrole"),
+        default=UserRole.USER,
+        nullable=False
+    )
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     is_email_verified = db.Column(db.Boolean, default=False, nullable=False)
     is_phone_verified = db.Column(db.Boolean, default=False, nullable=False)
-    # values_callable keeps SQLAlchemy using the enum's .value (lowercase 'local',
-    # 'google') to match the existing MySQL column `enum('local','google','phone')`.
-    # Without this, SQLAlchemy 2.1+ would serialize by enum NAME ('LOCAL', 'GOOGLE')
-    # and MySQL would reject the insert.
-    auth_provider = db.Column(
-        db.Enum(AuthProvider, values_callable=lambda e: [m.value for m in e]),
-        default=AuthProvider.LOCAL,
-        nullable=False,
-    )
+    auth_provider = db.Column(AuthProviderType(), default=AuthProvider.LOCAL, nullable=False)
     provider_user_id = db.Column(db.String(255), nullable=True)  # For OAuth provider user ID
     last_login = db.Column(db.DateTime, nullable=True)
+
+    # Account deletion (24h grace; soft close — rows retained for legal/ops)
+    account_deletion_requested_at = db.Column(db.DateTime, nullable=True)
+    account_deletion_effective_at = db.Column(db.DateTime, nullable=True, index=True)
+    account_deleted_at = db.Column(db.DateTime, nullable=True)
     
     # Relationships
     merchant_profile = db.relationship('MerchantProfile', back_populates='user', uselist=False)
@@ -142,10 +186,17 @@ class User(BaseModel):
         return cls.query.filter_by(email=email).first()
     
     @classmethod
+    def get_by_phone(cls, phone):
+        """Get user by phone number."""
+        return cls.query.filter_by(phone=phone).first()
+    
+    @classmethod
     def get_by_provider_id(cls, provider, provider_user_id):
         """Get user by OAuth provider ID."""
+        # Convert enum to value for query
+        provider_value = provider.value if isinstance(provider, AuthProvider) else provider
         return cls.query.filter_by(
-            auth_provider=provider,
+            auth_provider=provider_value,
             provider_user_id=provider_user_id
         ).first()
 
@@ -155,10 +206,22 @@ class MerchantProfile(BaseModel):
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, unique=True)
+    username = db.Column(db.String(50), unique=True, nullable=True, index=True)  # Unique username for mobile app
+    username_updated_at = db.Column(db.DateTime, nullable=True)  # Track last username change for 1-year restriction
+    profile_img = db.Column(db.String(512), nullable=True)  # URL for profile image
     business_name = db.Column(db.String(200), nullable=False)
     business_description = db.Column(db.Text, nullable=True)
     business_email = db.Column(db.String(120), nullable=False)
-    business_phone = db.Column(db.String(20), nullable=False)
+
+    # Public bio (short, Instagram-style header text — distinct from the long
+    # business_description). Stored as Text so the length cap stays a product
+    # rule and 4-byte emoji never truncate mid-character.
+    bio = db.Column(db.Text, nullable=True)
+    bio_link = db.Column(db.String(512), nullable=True)  # single "link in bio", http(s) only
+    bio_link_label = db.Column(db.String(60), nullable=True)
+    bio_updated_at = db.Column(db.DateTime, nullable=True)
+
+    business_phone = db.Column(db.String(30), nullable=False)  # Increased to 30 to handle international numbers with formatting
     business_address = db.Column(db.Text, nullable=False)
     
     # Country and Region Information
@@ -206,6 +269,11 @@ class MerchantProfile(BaseModel):
     shiprocket_pickup_location_id = db.Column(db.Integer, nullable=True, index=True)
     shiprocket_pickup_location_name = db.Column(db.String(100), nullable=True)
     contact_person_name = db.Column(db.String(100), nullable=True)  # Contact person for pickup location
+
+    # Account deletion (24h grace; soft close — rows retained for legal/ops)
+    account_deletion_requested_at = db.Column(db.DateTime, nullable=True)
+    account_deletion_effective_at = db.Column(db.DateTime, nullable=True, index=True)
+    account_deleted_at = db.Column(db.DateTime, nullable=True)
 
     # Relationships
     user = db.relationship('User', back_populates='merchant_profile')
@@ -262,7 +330,39 @@ class MerchantProfile(BaseModel):
     def is_indian_merchant(self):
         """Check if merchant is from India."""
         return self.country_code == CountryCode.INDIA.value
-    
+
+    def is_publicly_visible(self):
+        """
+        Whether this merchant may be shown to shoppers at all.
+
+        Single source of truth for every public read (public profile, bio,
+        intro video). Excludes soft-closed, grace-period-elapsed and suspended
+        merchants. Does NOT consider verification — see
+        `is_public_media_visible` for content held to a stricter bar.
+        """
+        if self.account_deleted_at is not None:
+            return False
+        if (
+            self.account_deletion_effective_at is not None
+            and self.account_deletion_effective_at <= datetime.utcnow()
+        ):
+            return False
+        user = self.user or User.query.get(self.user_id)
+        if user is not None and not user.is_active:
+            return False
+        return True
+
+    def is_public_media_visible(self):
+        """
+        Whether merchant-authored public media (currently the intro video) may
+        be shown. Stricter than `is_publicly_visible`: unverified merchants do
+        not get to publish prominent unmoderated media.
+        """
+        if not self.is_publicly_visible():
+            return False
+        return bool(self.is_verified) and self.verification_status == VerificationStatus.APPROVED
+
+
     def validate_country_specific_fields(self):
         """Validate country-specific fields."""
         validations = self.get_field_validations()
@@ -296,6 +396,82 @@ class MerchantProfile(BaseModel):
     def get_by_business_name(cls, business_name):
         """Get merchant profile by business name."""
         return cls.query.filter_by(business_name=business_name).first()
+    
+    @classmethod
+    def get_by_username(cls, username):
+        """Get merchant profile by username (case-insensitive)."""
+        if not username:
+            return None
+        return cls.query.filter(db.func.lower(cls.username) == username.lower()).first()
+    
+    @classmethod
+    def is_username_available(cls, username):
+        """Check if username is available (case-insensitive)."""
+        if not username:
+            return False
+        return cls.get_by_username(username) is None
+    
+    @classmethod
+    def generate_username(cls, business_name=None, first_name=None):
+        """
+        Auto-generate a unique username from business_name or first_name.
+        Format: {base_name}_{random_4_digits}
+        """
+        import random
+        import re
+        
+        # Choose base name: prefer business_name, fallback to first_name
+        base_name = None
+        if business_name:
+            base_name = business_name
+        elif first_name:
+            base_name = first_name
+        
+        # If no name provided, use generic prefix
+        if not base_name:
+            base_name = "merchant"
+        
+        # Clean the base name: remove special chars, keep alphanumeric and spaces
+        base_name = re.sub(r'[^a-zA-Z0-9\s]', '', base_name)
+        # Replace spaces with underscores
+        base_name = base_name.replace(' ', '_')
+        # Convert to lowercase
+        base_name = base_name.lower()
+        # Remove multiple underscores
+        base_name = re.sub(r'_+', '_', base_name)
+        # Remove leading/trailing underscores
+        base_name = base_name.strip('_')
+        
+        # Ensure base_name is not empty
+        if not base_name:
+            base_name = "merchant"
+        
+        # Truncate to fit with random digits (max 30 chars total, so base max 26)
+        if len(base_name) > 26:
+            base_name = base_name[:26]
+        
+        # Try to generate unique username (max 10 attempts)
+        max_attempts = 10
+        for attempt in range(max_attempts):
+            # Generate 4 random digits
+            random_digits = random.randint(1000, 9999)
+            username = f"{base_name}_{random_digits}"
+            
+            # Check if available
+            if cls.is_username_available(username):
+                return username
+        
+        # If all attempts failed, use generic with longer random number
+        random_long = random.randint(100000, 999999)
+        username = f"merchant_{random_long}"
+        
+        # Final check - if still not available, add timestamp
+        if not cls.is_username_available(username):
+            from datetime import datetime
+            timestamp = int(datetime.now().timestamp()) % 1000000
+            username = f"merchant_{timestamp}"
+        
+        return username
     
     def update_verification_status(self, status, notes=None):
         """Update verification status and send notifications."""
@@ -411,14 +587,17 @@ class EmailVerification(BaseModel):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     token = db.Column(db.String(255), nullable=False, unique=True)
+    # 6-digit OTP for app-based email verification (web flow uses the link token above).
+    # Nullable so the existing link-based rows are unaffected.
+    otp = db.Column(db.String(6), nullable=True)
     expires_at = db.Column(db.DateTime, nullable=False)
     is_used = db.Column(db.Boolean, default=False, nullable=False)
-    
+
     @classmethod
     def get_by_id(cls, id):
         """Get verification by ID."""
         return cls.query.filter_by(id=id).first()
-    
+
     @classmethod
     def create_token(cls, user_id, expires_at):
         """Create a new verification token."""
@@ -430,12 +609,72 @@ class EmailVerification(BaseModel):
         )
         verification.save()
         return token
-    
+
+    @classmethod
+    def create_email_otp(cls, user_id, expires_at, otp_override=None):
+        """Create a new 6-digit email-verification OTP for app-based merchant verification.
+
+        Mirrors PhoneVerification.create_otp. A unique uuid is still stored in `token`
+        to satisfy the NOT NULL / UNIQUE constraint on that column; verification is done
+        against `otp`. Returns the generated OTP string.
+        """
+        import random
+        otp = str(otp_override) if otp_override is not None else ''.join(random.choices('0123456789', k=6))
+        verification = cls(
+            token=str(uuid.uuid4()),
+            user_id=user_id,
+            otp=otp,
+            expires_at=expires_at,
+            # Set created_at explicitly in Python UTC (like PhoneVerification) so the
+            # has_recent_otp throttle is not affected by the DB server's timezone.
+            created_at=datetime.utcnow()
+        )
+        verification.save()
+        return otp
+
     @classmethod
     def get_by_token(cls, token):
         """Get verification by token."""
         return cls.query.filter_by(token=token, is_used=False).first()
-    
+
+    @classmethod
+    def verify_email_otp(cls, user_id, otp):
+        """Verify an email OTP for a user.
+
+        Returns True if a matching unused, unexpired OTP exists (and marks it used),
+        otherwise False. Does not mutate user/merchant state — that is the caller's
+        responsibility (mirrors how the link flow updates status in the controller).
+        """
+        verification = cls.query.filter_by(
+            user_id=user_id,
+            otp=otp,
+            is_used=False
+        ).order_by(cls.id.desc()).first()
+
+        if not verification:
+            return False
+
+        if verification.expires_at < datetime.utcnow():
+            return False
+
+        verification.is_used = True
+        db.session.commit()
+        return True
+
+    @classmethod
+    def has_recent_otp(cls, user_id, within_seconds=30):
+        """Return True if an OTP was created for this user within `within_seconds`.
+
+        DB-level throttle fallback used when Redis is unavailable, so resend cannot be
+        spammed even without the Redis rate limiter.
+        """
+        cutoff = datetime.utcnow() - timedelta(seconds=within_seconds)
+        return cls.query.filter(
+            cls.user_id == user_id,
+            cls.otp.isnot(None),
+            cls.created_at >= cutoff
+        ).first() is not None
+
     def use(self):
         """Mark verification token as used."""
         self.is_used = True
@@ -446,11 +685,12 @@ class PhoneVerification(BaseModel):
     __tablename__ = 'phone_verifications'
     
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    phone = db.Column(db.String(20), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)  # Made nullable for sign-up flow
+    phone = db.Column(db.String(20), nullable=False, index=True)
     otp = db.Column(db.String(6), nullable=False)
     expires_at = db.Column(db.DateTime, nullable=False)
     is_used = db.Column(db.Boolean, default=False, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     
     @classmethod
     def get_by_id(cls, id):
@@ -458,12 +698,34 @@ class PhoneVerification(BaseModel):
         return cls.query.filter_by(id=id).first()
     
     @classmethod
-    def create_otp(cls, user_id, phone, expires_at):
-        """Create a new OTP."""
+    def get_by_phone(cls, phone, is_used=False):
+        """Get latest verification by phone number."""
+        return cls.query.filter_by(
+            phone=phone,
+            is_used=is_used
+        ).order_by(cls.created_at.desc()).first()
+    
+    @classmethod
+    def create_otp(cls, user_id, phone, expires_at, otp_override=None):
+        """Create a new OTP for existing user."""
         import random
-        otp = ''.join(random.choices('0123456789', k=6))
+        otp = str(otp_override) if otp_override is not None else ''.join(random.choices('0123456789', k=6))
         verification = cls(
             user_id=user_id,
+            phone=phone,
+            otp=otp,
+            expires_at=expires_at
+        )
+        verification.save()
+        return otp
+    
+    @classmethod
+    def create_otp_for_signup(cls, phone, expires_at, otp_override=None):
+        """Create a new OTP for sign-up (no user_id)."""
+        import random
+        otp = str(otp_override) if otp_override is not None else ''.join(random.choices('0123456789', k=6))
+        verification = cls(
+            user_id=None,  # No user_id for sign-up
             phone=phone,
             otp=otp,
             expires_at=expires_at
@@ -503,3 +765,101 @@ class PhoneVerification(BaseModel):
                     db.session.commit()
         
         return True
+    
+    @classmethod
+    def verify_otp_by_phone(cls, phone, otp):
+        """Verify OTP by phone number (for sign-up/login)."""
+        verification = cls.query.filter_by(
+            phone=phone,
+            otp=otp,
+            is_used=False
+        ).order_by(cls.created_at.desc()).first()
+        
+        if not verification:
+            return None
+        
+        if verification.expires_at < datetime.utcnow():
+            return None
+        
+        verification.is_used = True
+        db.session.commit()
+        
+        return verification
+
+
+class CreatorSignupPending(BaseModel):
+    """Stores name/email for creator signup until OTP is verified. One row per phone."""
+    __tablename__ = 'creator_signup_pending'
+
+    id = db.Column(db.Integer, primary_key=True)
+    phone = db.Column(db.String(20), nullable=False, unique=True, index=True)
+    email = db.Column(db.String(255), nullable=False)
+    first_name = db.Column(db.String(100), nullable=False)
+    last_name = db.Column(db.String(100), nullable=False)
+    last_otp_sent_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    @classmethod
+    def get_by_phone(cls, phone):
+        return cls.query.filter_by(phone=phone).first()
+
+    @classmethod
+    def upsert(cls, phone, email, first_name, last_name):
+        row = cls.get_by_phone(phone)
+        if row:
+            row.email = email
+            row.first_name = first_name
+            row.last_name = last_name
+            row.last_otp_sent_at = datetime.utcnow()
+            db.session.commit()
+            return row
+        row = cls(
+            phone=phone,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            last_otp_sent_at=datetime.utcnow()
+        )
+        row.save()
+        return row
+
+    @classmethod
+    def delete_by_phone(cls, phone):
+        cls.query.filter_by(phone=phone).delete()
+        db.session.commit()
+
+
+class CreatorProfile(BaseModel):
+    """Creator profile: one per user with role CREATOR. Categories and availability."""
+    __tablename__ = 'creator_profiles'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False, unique=True)
+    availability = db.Column(db.String(20), nullable=False, default='available')
+    language_preferences = db.Column(db.String(100), nullable=True)
+    portfolio_links = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    user = db.relationship('User', backref=db.backref('creator_profile', uselist=False))
+
+    @classmethod
+    def get_by_user_id(cls, user_id):
+        return cls.query.filter_by(user_id=user_id).first()
+
+
+class CreatorCategory(BaseModel):
+    """Creator's selected categories (min 5). Links creator_profile to categories."""
+    __tablename__ = 'creator_categories'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    creator_id = db.Column(db.Integer, db.ForeignKey('creator_profiles.id', ondelete='CASCADE'), nullable=False)
+    category_id = db.Column(db.Integer, db.ForeignKey('categories.category_id', ondelete='CASCADE'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (db.UniqueConstraint('creator_id', 'category_id', name='uk_creator_category'),)
+
+    @classmethod
+    def delete_by_creator_id(cls, creator_id):
+        cls.query.filter_by(creator_id=creator_id).delete()
+        db.session.commit()

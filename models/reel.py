@@ -1,0 +1,357 @@
+# models/reel.py
+from datetime import datetime, timezone
+from common.database import db, BaseModel
+from auth.models.models import MerchantProfile, User
+from models.product import Product
+from models.product_stock import ProductStock
+
+
+class Reel(BaseModel):
+    """Reel model for mobile app video content."""
+    __tablename__ = 'reels'
+    
+    reel_id = db.Column(db.Integer, primary_key=True)
+    merchant_id = db.Column(db.Integer, db.ForeignKey('merchant_profiles.id'), nullable=False, index=True)
+    product_id = db.Column(db.Integer, db.ForeignKey('products.product_id'), nullable=True, index=True)  # null for external reels
+    
+    # External product fields (when product_id is null)
+    product_url = db.Column(db.String(2048), nullable=True)
+    product_name = db.Column(db.String(500), nullable=True)
+    external_product_price = db.Column(db.Numeric(12, 2), nullable=True)  # Display price for external reels
+    category_id = db.Column(db.Integer, db.ForeignKey('categories.category_id'), nullable=True)
+    category_name = db.Column(db.String(255), nullable=True)
+    platform = db.Column(db.String(50), nullable=True, index=True)  # aoin | flipkart | amazon | myntra | other
+    
+    # Video storage
+    video_url = db.Column(db.String(512), nullable=False)
+    video_public_id = db.Column(db.String(255), nullable=True)  # Cloudinary public_id or S3 key
+    thumbnail_url = db.Column(db.String(512), nullable=True)
+    thumbnail_public_id = db.Column(db.String(255), nullable=True)
+    
+    # Metadata
+    description = db.Column(db.Text, nullable=False)  # REQUIRED
+    duration_seconds = db.Column(db.Integer, nullable=True)
+    file_size_bytes = db.Column(db.BigInteger, nullable=True)
+    video_format = db.Column(db.String(10), nullable=True)  # mp4, mov, avi, etc.
+    resolution = db.Column(db.String(20), nullable=True)  # e.g., "1920x1080"
+    
+    # Stats
+    views_count = db.Column(db.Integer, default=0, nullable=False)
+    likes_count = db.Column(db.Integer, default=0, nullable=False)
+    shares_count = db.Column(db.Integer, default=0, nullable=False)
+    
+    # Status
+    is_active = db.Column(db.Boolean, default=True, nullable=False, index=True)
+    # Note: approval_status kept for backward compatibility but defaults to 'approved'
+    # Reels don't require approval - they are active immediately
+    approval_status = db.Column(db.String(20), default='approved', nullable=False, index=True)
+    approved_at = db.Column(db.DateTime, nullable=True)
+    approved_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    rejection_reason = db.Column(db.String(255), nullable=True)
+    
+    # Timestamps (inherited from BaseModel, but we'll override for consistency)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+    deleted_at = db.Column(db.DateTime, nullable=True)
+    
+    # Relationships
+    merchant = db.relationship('MerchantProfile', backref=db.backref('reels', lazy='dynamic'))
+    product = db.relationship('Product', backref=db.backref('reels', lazy='dynamic'))
+    approved_by_admin = db.relationship('User', backref=db.backref('approved_reels', lazy='dynamic'), foreign_keys=[approved_by])
+    
+    # Disabling reasons constants
+    DISABLING_REASONS = {
+        'PRODUCT_OUT_OF_STOCK': 'Product stock quantity is 0',
+        'PRODUCT_DELETED': 'Product has been deleted',
+        'PRODUCT_NOT_APPROVED': 'Product is not approved by admin',
+        'PRODUCT_REJECTED': 'Product has been rejected',
+        'PRODUCT_PENDING_APPROVAL': 'Product is pending approval',
+        'PRODUCT_INACTIVE': 'Product is inactive',
+        'PRODUCT_MERCHANT_MISMATCH': 'Product does not belong to merchant',
+        'REEL_DELETED': 'Reel has been deleted',
+        'REEL_INACTIVE': 'Reel is inactive',
+        'PRODUCT_NOT_FOUND': 'Product not found'
+    }
+    
+    @property
+    def is_visible(self):
+        """Check if reel should be visible (no disabling reasons)."""
+        return len(self.get_disabling_reasons()) == 0
+    
+    def get_disabling_reasons(self):
+        """
+        Get array of reasons why reel is disabled.
+        Returns empty array if reel is visible.
+        
+        Returns:
+            list: Array of reason codes (strings)
+        """
+        reasons = []
+        
+        # Check reel status
+        if self.deleted_at is not None:
+            reasons.append('REEL_DELETED')
+        
+        if not self.is_active:
+            reasons.append('REEL_INACTIVE')
+        
+        # External reels: no product checks, only reel-level above
+        if self.product_id is None:
+            return reasons
+        
+        # AOIN reels: check product (product should exist when product_id is set)
+        if not self.product:
+            reasons.append('PRODUCT_NOT_FOUND')
+            return reasons
+        
+        # Check product status
+        if self.product.deleted_at is not None:
+            reasons.append('PRODUCT_DELETED')
+        
+        if not self.product.active_flag:
+            reasons.append('PRODUCT_INACTIVE')
+        
+        if self.product.approval_status == 'pending':
+            reasons.append('PRODUCT_PENDING_APPROVAL')
+        elif self.product.approval_status == 'rejected':
+            reasons.append('PRODUCT_REJECTED')
+        elif self.product.approval_status != 'approved':
+            reasons.append('PRODUCT_NOT_APPROVED')
+        
+        # Check merchant ownership
+        if self.product.merchant_id != self.merchant_id:
+            reasons.append('PRODUCT_MERCHANT_MISMATCH')
+        
+        # Check stock
+        stock_qty = self.product.stock.stock_qty if self.product.stock else 0
+        if stock_qty <= 0:
+            reasons.append('PRODUCT_OUT_OF_STOCK')
+        
+        return reasons
+    
+    def serialize(self, include_reasons=True, include_product=True, include_merchant=False, fields=None):
+        """
+        Serialize reel with disabling reasons.
+        
+        Args:
+            include_reasons: Whether to include disabling_reasons array
+            include_product: Whether to include product info
+            include_merchant: Whether to include merchant info
+            fields: Optional list of field names to include (if None, includes all)
+            
+        Returns:
+            dict: Serialized reel data
+        """
+        # Define all available fields; always expose product_url and platform
+        all_data = {
+            'reel_id': self.reel_id,
+            'merchant_id': self.merchant_id,
+            'product_id': self.product_id,
+            'product_url': self.product_url,
+            'platform': self.platform,
+            'video_url': self.video_url,
+            'thumbnail_url': self.thumbnail_url,
+            'description': self.description,
+            'duration_seconds': self.duration_seconds,
+            'file_size_bytes': self.file_size_bytes,
+            'video_format': self.video_format,
+            'resolution': self.resolution,
+            'views_count': self.views_count,
+            'likes_count': self.likes_count,
+            'shares_count': self.shares_count,
+            'is_active': self.is_active,
+            'approval_status': self.approval_status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        
+        # Include disabling reasons if requested
+        if include_reasons:
+            disabling_reasons = self.get_disabling_reasons()
+            all_data['disabling_reasons'] = disabling_reasons
+            all_data['is_visible'] = len(disabling_reasons) == 0
+        
+        # Include product info: AOIN reels get full product object; external get product_name/category from reel
+        if include_product:
+            if self.product_id is not None and self.product:
+                # AOIN reel: derive pricing from the linked product so clients can always display a price
+                # consistently across AOIN and external reels.
+                all_data['product_name'] = self.product.product_name
+                all_data['category_id'] = self.product.category_id
+                all_data['category_name'] = self.product.category.name if self.product.category else None
+                all_data['price'] = float(self.product.selling_price) if self.product.selling_price is not None else None
+                image_urls = Reel._product_image_urls(self.product)
+                all_data['product'] = {
+                    'product_id': self.product.product_id,
+                    'product_name': self.product.product_name,
+                    'category_id': self.product.category_id,
+                    'category_name': self.product.category.name if self.product.category else None,
+                    'stock_qty': self.product.stock.stock_qty if self.product.stock else 0,
+                    'selling_price': float(self.product.selling_price) if self.product.selling_price else None,
+                    'primary_image': image_urls[0] if image_urls else None,
+                    'product_images': image_urls,
+                }
+            else:
+                # External reel: no product object; product_url, product_name, price, category already on reel
+                all_data['product_name'] = self.product_name
+                all_data['price'] = float(self.external_product_price) if self.external_product_price is not None else None
+                all_data['category_id'] = self.category_id
+                all_data['category_name'] = self.category_name
+        
+        # Include merchant info
+        if include_merchant and self.merchant:
+            all_data['merchant'] = {
+                'merchant_id': self.merchant.id,
+                'business_name': self.merchant.business_name,
+                'profile_img': self.merchant.profile_img,
+            }
+        
+        # Filter by fields if specified
+        if fields:
+            # Validate fields
+            valid_fields = set(all_data.keys())
+            requested_fields = set(fields)
+            invalid_fields = requested_fields - valid_fields
+            
+            if invalid_fields:
+                # Log warning but continue with valid fields
+                from flask import current_app
+                if current_app:
+                    current_app.logger.warning(f"Invalid fields requested: {invalid_fields}")
+            
+            # Filter data to only include requested valid fields
+            data = {k: v for k, v in all_data.items() if k in requested_fields and k in valid_fields}
+        else:
+            data = all_data
+        
+        return data
+    
+    def increment_views(self):
+        """Increment views count."""
+        self.views_count += 1
+        db.session.commit()
+    
+    def increment_likes(self):
+        """Increment likes count."""
+        self.likes_count += 1
+        db.session.commit()
+    
+    def decrement_likes(self):
+        """Decrement likes count."""
+        if self.likes_count > 0:
+            self.likes_count -= 1
+            db.session.commit()
+    
+    def increment_shares(self):
+        """Increment shares count."""
+        self.shares_count += 1
+        db.session.commit()
+    
+    @staticmethod
+    def _product_image_urls(product):
+        """Ordered image URLs for an AOIN product (main image first, then sort_order)."""
+        from models.enums import MediaType
+        if not product or not getattr(product, 'media', None):
+            return []
+        images = [
+            m for m in product.media
+            if m.type == MediaType.IMAGE and m.deleted_at is None
+        ]
+        if not images:
+            return []
+        images.sort(key=lambda m: (0 if m.is_main_image else 1, m.sort_order or 0, m.media_id or 0))
+        return [m.url for m in images]
+    
+    @classmethod
+    def loader_options_for_api(cls):
+        """Eager loads for serialize() with product + merchant (avoids N+1 on product media)."""
+        from sqlalchemy.orm import joinedload, selectinload
+        return (
+            joinedload(cls.product).joinedload(Product.category),
+            joinedload(cls.product).selectinload(Product.media),
+            joinedload(cls.merchant),
+        )
+    
+    @classmethod
+    def get_visible_reels(cls, query=None, user_id=None):
+        """
+        Get query for visible reels only (AOIN + external).
+        AOIN: product_id set, product not deleted/active/approved, stock > 0.
+        External: product_id null, product_url set, reel-level only (not deleted, active).
+
+        When user_id is provided, also apply that user's personal "not interested"
+        preferences: reels from merchants the user has blocked are excluded, and
+        reels in categories the user has hidden are excluded (AOIN via the linked
+        product's category, external via the reel's own category_id). This is a
+        user-scoped filter only and has no effect on other users. Passing no
+        user_id preserves the original (anonymous/public) behaviour exactly.
+        """
+        from models.product import Product
+        from auth.models.models import MerchantProfile
+        from sqlalchemy import or_
+
+        if query is None:
+            query = cls.query
+
+        # Resolve this user's "not interested" preferences (empty for anonymous).
+        blocked_merchant_ids = set()
+        hidden_category_ids = set()
+        if user_id is not None:
+            from models.user_blocked_merchant import UserBlockedMerchant
+            from models.user_hidden_category import UserHiddenCategory
+            blocked_merchant_ids = UserBlockedMerchant.get_blocked_merchant_ids(user_id)
+            hidden_category_ids = UserHiddenCategory.get_hidden_category_ids(user_id)
+
+        closed_merchant_ids = db.session.query(MerchantProfile.id).filter(
+            MerchantProfile.account_deleted_at.isnot(None)
+        )
+        base = query.filter(
+            cls.deleted_at.is_(None),
+            cls.is_active == True,
+            ~cls.merchant_id.in_(closed_merchant_ids),
+        )
+
+        # Exclude merchants this user marked "not interested".
+        if blocked_merchant_ids:
+            base = base.filter(~cls.merchant_id.in_(blocked_merchant_ids))
+
+        # Visible AOIN reels: has product, product valid, stock > 0
+        aoin_subq = (
+            base.filter(cls.product_id.isnot(None))
+            .join(Product, cls.product_id == Product.product_id)
+            .join(ProductStock, Product.product_id == ProductStock.product_id)
+            .filter(
+                Product.deleted_at.is_(None),
+                Product.active_flag == True,
+                Product.approval_status == 'approved',
+                ProductStock.stock_qty > 0,
+            )
+        )
+        # Visible external reels: no product, has product_url
+        external_subq = base.filter(
+            cls.product_id.is_(None),
+            cls.product_url.isnot(None),
+        )
+
+        # Exclude categories this user marked "not interested".
+        if hidden_category_ids:
+            # AOIN reels: category comes from the linked product.
+            aoin_subq = aoin_subq.filter(~Product.category_id.in_(hidden_category_ids))
+            # External reels: category stored on the reel (keep reels with no category).
+            external_subq = external_subq.filter(
+                or_(
+                    cls.category_id.is_(None),
+                    ~cls.category_id.in_(hidden_category_ids),
+                )
+            )
+
+        aoin_ids = aoin_subq.with_entities(cls.reel_id)
+        external_ids = external_subq.with_entities(cls.reel_id)
+        union_ids = aoin_ids.union(external_ids)
+        # Preserve original query filters (e.g. merchant_id)
+        return query.filter(
+            cls.deleted_at.is_(None),
+            cls.is_active == True,
+            cls.reel_id.in_(union_ids),
+        )
+
