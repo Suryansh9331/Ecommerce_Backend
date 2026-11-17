@@ -7,6 +7,8 @@ from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timedelta
 import cloudinary
 import cloudinary.uploader
+from services.s3_service import get_s3_service
+from flask import current_app
 import requests
 from dateutil import parser
 import pytz
@@ -15,9 +17,20 @@ from models.live_stream import StreamStatus
 
 class MerchantLiveStreamController:
     @staticmethod
+    def upload_thumbnail_to_s3(file):
+        """Upload live stream thumbnail to S3"""
+        try:
+            s3_service = get_s3_service()
+            upload_result = s3_service.upload_generic_asset(file)
+            return upload_result['url'], upload_result['s3_key']
+        except Exception as e:
+            current_app.logger.error(f"Failed to upload live stream thumbnail to S3: {str(e)}")
+            raise Exception(f"Failed to upload thumbnail: {str(e)}")
+    
+    @staticmethod
     def upload_thumbnail_to_cloudinary(file):
-        result = cloudinary.uploader.upload(file, folder="live_stream_thumbnails")
-        return result['secure_url'], result['public_id']
+        """Legacy method - kept for backward compatibility but redirects to S3"""
+        return MerchantLiveStreamController.upload_thumbnail_to_s3(file)
 
     @staticmethod
     def schedule_youtube_live_event(access_token, title, description, scheduled_time, return_livestream_id=False, allow_embedding=True):
@@ -41,7 +54,14 @@ class MerchantLiveStreamController:
             },
             "kind": "youtube#liveBroadcast"
         }
-        broadcast_resp = requests.post(broadcast_url, headers=headers, json=broadcast_body)
+        try:
+            broadcast_resp = requests.post(broadcast_url, headers=headers, json=broadcast_body, timeout=10)
+        except requests.exceptions.Timeout:
+            logging.error(f"External API timeout: {broadcast_url}")
+            raise Exception(f"YouTube API timeout (broadcast): Request timed out after 10 seconds")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"External API error: {broadcast_url} - {str(e)}")
+            raise Exception(f"YouTube API error (broadcast): {str(e)}")
         logging.debug(f"Broadcast response: {broadcast_resp.status_code} {broadcast_resp.text}")
         if broadcast_resp.status_code != 200:
             raise Exception(f"YouTube API error (broadcast): {broadcast_resp.text}")
@@ -61,7 +81,14 @@ class MerchantLiveStreamController:
                 "resolution": "variable"
             }
         }
-        livestream_resp = requests.post(livestream_url, headers=headers, json=livestream_body)
+        try:
+            livestream_resp = requests.post(livestream_url, headers=headers, json=livestream_body, timeout=10)
+        except requests.exceptions.Timeout:
+            logging.error(f"External API timeout: {livestream_url}")
+            raise Exception(f"YouTube API timeout (livestream): Request timed out after 10 seconds")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"External API error: {livestream_url} - {str(e)}")
+            raise Exception(f"YouTube API error (livestream): {str(e)}")
         logging.debug(f"LiveStream response: {livestream_resp.status_code} {livestream_resp.text}")
         if livestream_resp.status_code != 200:
             raise Exception(f"YouTube API error (livestream): {livestream_resp.text}")
@@ -74,30 +101,39 @@ class MerchantLiveStreamController:
             "id": broadcast_id,
             "streamId": livestream_id
         }
-        bind_resp = requests.post(bind_url, headers=headers, json=bind_body)
+        try:
+            bind_resp = requests.post(bind_url, headers=headers, json=bind_body, timeout=10)
+        except requests.exceptions.Timeout:
+            logging.error(f"External API timeout: {bind_url}")
+            raise Exception(f"YouTube API timeout (bind): Request timed out after 10 seconds")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"External API error: {bind_url} - {str(e)}")
+            raise Exception(f"YouTube API error (bind): {str(e)}")
         logging.debug(f"Bind response: {bind_resp.status_code} {bind_resp.text}")
         if bind_resp.status_code != 200:
             raise Exception(f"YouTube API error (bind): {bind_resp.text}")
 
         # 4. Fetch the liveStream info to get the RTMP details (cdn)
         info_url = f"https://www.googleapis.com/youtube/v3/liveStreams?part=cdn&id={livestream_id}"
-        info_resp = requests.get(info_url, headers=headers)
-        logging.debug(f"LiveStream info GET response: {info_resp.status_code} {info_resp.text}")
-        if info_resp.status_code == 200:
-            info_data = info_resp.json()
-            items = info_data.get('items', [])
-            if items:
-                cdn = items[0].get('cdn', {})
-                ingestion_info = cdn.get('ingestionInfo', {})
-                rtmp_info = {
-                    "ingestionAddress": ingestion_info.get("ingestionAddress"),
-                    "streamName": ingestion_info.get("streamName"),
-                    "streamUrl": f"{ingestion_info.get('ingestionAddress')}/{ingestion_info.get('streamName')}" if ingestion_info.get("ingestionAddress") and ingestion_info.get("streamName") else None
-                }
-            else:
-                rtmp_info = {"ingestionAddress": None, "streamName": None, "streamUrl": None}
-        else:
-            rtmp_info = {"ingestionAddress": None, "streamName": None, "streamUrl": None}
+        rtmp_info = {"ingestionAddress": None, "streamName": None, "streamUrl": None}
+        try:
+            info_resp = requests.get(info_url, headers=headers, timeout=10)
+            logging.debug(f"LiveStream info GET response: {info_resp.status_code} {info_resp.text}")
+            if info_resp.status_code == 200:
+                info_data = info_resp.json()
+                items = info_data.get('items', [])
+                if items:
+                    cdn = items[0].get('cdn', {})
+                    ingestion_info = cdn.get('ingestionInfo', {})
+                    rtmp_info = {
+                        "ingestionAddress": ingestion_info.get("ingestionAddress"),
+                        "streamName": ingestion_info.get("streamName"),
+                        "streamUrl": f"{ingestion_info.get('ingestionAddress')}/{ingestion_info.get('streamName')}" if ingestion_info.get("ingestionAddress") and ingestion_info.get("streamName") else None
+                    }
+        except requests.exceptions.Timeout:
+            logging.error(f"External API timeout: {info_url}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"External API error: {info_url} - {str(e)}")
         logging.debug(f"RTMP info (after GET): {rtmp_info}")
 
         # 5. Return all info
@@ -169,19 +205,31 @@ class MerchantLiveStreamController:
                         "Authorization": f"Bearer {access_token}",
                         "Accept": "application/json"
                     }
-                    info_resp = requests.get(info_url, headers=headers)
-                    logging.debug(f"[get_by_id] LiveStream info GET response: {info_resp.status_code} {info_resp.text}")
-                    if info_resp.status_code == 200:
-                        info_data = info_resp.json()
-                        items = info_data.get('items', [])
-                        if items:
-                            cdn = items[0].get('cdn', {})
-                            ingestion_info = cdn.get('ingestionInfo', {})
-                            rtmp_info = {
-                                "ingestionAddress": ingestion_info.get("ingestionAddress"),
-                                "streamName": ingestion_info.get("streamName"),
-                                "streamUrl": f"{ingestion_info.get('ingestionAddress')}/{ingestion_info.get('streamName')}" if ingestion_info.get("ingestionAddress") and ingestion_info.get("streamName") else None
-                            }
+                    try:
+                        info_resp = requests.get(info_url, headers=headers, timeout=10)
+                    except requests.exceptions.Timeout:
+                        logging.error(f"External API timeout: {info_url}")
+                        rtmp_info = None
+                    except requests.exceptions.RequestException as e:
+                        logging.error(f"External API error: {info_url} - {str(e)}")
+                        rtmp_info = None
+                    else:
+                        logging.debug(f"[get_by_id] LiveStream info GET response: {info_resp.status_code} {info_resp.text}")
+                        if info_resp.status_code == 200:
+                            info_data = info_resp.json()
+                            items = info_data.get('items', [])
+                            if items:
+                                cdn = items[0].get('cdn', {})
+                                ingestion_info = cdn.get('ingestionInfo', {})
+                                rtmp_info = {
+                                    "ingestionAddress": ingestion_info.get("ingestionAddress"),
+                                    "streamName": ingestion_info.get("streamName"),
+                                    "streamUrl": f"{ingestion_info.get('ingestionAddress')}/{ingestion_info.get('streamName')}" if ingestion_info.get("ingestionAddress") and ingestion_info.get("streamName") else None
+                                }
+                            else:
+                                rtmp_info = None
+                        else:
+                            rtmp_info = None
             stream.rtmp_info = rtmp_info
         return stream
 
@@ -253,7 +301,14 @@ class MerchantLiveStreamController:
                     'Authorization': f'Bearer {access_token}',
                     'Accept': 'application/json'
                 }
-                resp = requests.post(url, headers=headers, params=params)
+                try:
+                    resp = requests.post(url, headers=headers, params=params, timeout=10)
+                except requests.exceptions.Timeout:
+                    logging.error(f"External API timeout: {url}")
+                    raise Exception(f'YouTube End Stream timeout: Request timed out after 10 seconds')
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"External API error: {url} - {str(e)}")
+                    raise Exception(f'YouTube End Stream failed: {str(e)}')
                 if resp.status_code != 200:
                     # Check for redundantTransition error (already ended)
                     try:
@@ -296,7 +351,14 @@ class MerchantLiveStreamController:
             "Authorization": f"Bearer {yt_token.access_token}",
             "Accept": "application/json"
         }
-        resp = requests.get(url, headers=headers, params=params)
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+        except requests.exceptions.Timeout:
+            logging.error(f"External API timeout: {url}")
+            raise Exception(f"YouTube API timeout: Request timed out after 10 seconds")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"External API error: {url} - {str(e)}")
+            raise Exception(f"YouTube API error: {str(e)}")
         if resp.status_code != 200:
             raise Exception(f"YouTube API error: {resp.text}")
         return resp.json().get("items", [])
@@ -315,7 +377,14 @@ class MerchantLiveStreamController:
             "Authorization": f"Bearer {yt_token.access_token}",
             "Accept": "application/json"
         }
-        resp = requests.get(url, headers=headers, params=params)
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+        except requests.exceptions.Timeout:
+            logging.error(f"External API timeout: {url}")
+            raise Exception(f"YouTube API timeout: Request timed out after 10 seconds")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"External API error: {url} - {str(e)}")
+            raise Exception(f"YouTube API error: {str(e)}")
         if resp.status_code != 200:
             raise Exception(f"YouTube API error: {resp.text}")
         items = resp.json().get("items", [])
@@ -420,7 +489,14 @@ class MerchantLiveStreamController:
             }
         }
         
-        resp = requests.put(url, headers=headers, json=body)
+        try:
+            resp = requests.put(url, headers=headers, json=body, timeout=10)
+        except requests.exceptions.Timeout:
+            logging.error(f"External API timeout: {url}")
+            raise Exception(f"YouTube API timeout updating embedding: Request timed out after 10 seconds")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"External API error: {url} - {str(e)}")
+            raise Exception(f"YouTube API error updating embedding: {str(e)}")
         if resp.status_code != 200:
             raise Exception(f"YouTube API error updating embedding: {resp.text}")
         

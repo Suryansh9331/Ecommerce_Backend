@@ -32,7 +32,18 @@ class Product(BaseModel):
                                                             # For now, assume it's informational or applied by merchant mentally before setting selling_price.
 
     # special_price is also GST-INCLUSIVE if a special offer is active.
-    special_price = db.Column(db.Numeric(10,2), nullable=True) 
+    special_price = db.Column(db.Numeric(10,2), nullable=True)
+
+    # Optional merchant-set price in the presentment currency, so a hero product can
+    # get a clean $49.99 instead of a derived $49.37. NULL means "derive it from the
+    # INR price at the daily rate".
+    #
+    # nullable=True with NO default= on purpose: init_db.py's auto-migration
+    # fabricates DEFAULT 0.00 for a NOT NULL Numeric it adds to an existing table,
+    # which would price every product in this store at zero dollars.
+    # See docs/MULTI_CURRENCY.md, Landmines #1.
+    presentment_price = db.Column(db.Numeric(10,2), nullable=True)
+    presentment_currency = db.Column(db.String(3), nullable=True)
     special_start = db.Column(db.Date)
     special_end   = db.Column(db.Date)
     
@@ -59,6 +70,18 @@ class Product(BaseModel):
     created_at    = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at    = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
     deleted_at    = db.Column(db.DateTime)
+
+    # Who removed it, and why. `deleted_at` alone cannot answer "was this taken down
+    # by an admin or retired by the merchant", and the merchant has to be told which
+    # it was — a listing that vanished without explanation is a support ticket.
+    #
+    # nullable=True with NO default=, per docs/MULTI_CURRENCY.md Landmines #1:
+    # init_db.py's auto-migration fabricates DEFAULT '' for a NOT NULL String added
+    # to an existing table, which would stamp every historical product as deleted by
+    # an empty role.
+    deleted_by_user_id = db.Column(db.Integer, nullable=True)
+    deleted_by_role    = db.Column(db.String(20), nullable=True)   # 'merchant' | 'admin'
+    deletion_reason    = db.Column(db.String(500), nullable=True)
 
     # REMOVED: base_price_calculated
     # REMOVED: gst_rate_percentage_applied
@@ -89,7 +112,21 @@ class Product(BaseModel):
             is_on_special = True
         return current_price, is_on_special
 
-    def serialize(self):
+    def serialize(self, currency=None):
+        """Serialize the product, optionally priced in a presentment currency.
+
+        `currency` defaults to a helper that reads `?currency=` off the request and
+        falls back to INR outside a request context — so the hundreds of existing
+        callers do not have to pass anything, and jobs and PDF rendering stay INR.
+
+        Without `?currency=` (or with FEATURE_MULTI_CURRENCY off) the output is
+        byte-identical to before, which is what makes changing the meaning of the
+        existing scalar price keys safe. See docs/MULTI_CURRENCY.md, Phase 3.
+        """
+        from services.currency_context import base_currency, money, resolve_request_currency
+
+        resolved_currency = resolve_request_currency(currency)
+        in_base = resolved_currency == base_currency()
 
         current_listed_inclusive_price, is_on_special = self.get_current_listed_inclusive_price()
 
@@ -98,6 +135,27 @@ class Product(BaseModel):
 
         # originalPrice is shown if there's a special offer active. It's the standard selling_price (inclusive).
         original_display_price = self.selling_price if is_on_special and self.selling_price != display_price else None
+
+        # Presentment blocks. `money()` never raises: with no usable FX rate it
+        # returns the INR amount labelled INR, so a listing renders a correct rupee
+        # price rather than a fabricated foreign one.
+        # An override only counts for the currency the merchant typed it in.
+        _override = getattr(self, "presentment_price", None)
+        if _override is not None and (
+            (getattr(self, "presentment_currency", None) or "").upper() != resolved_currency
+        ):
+            _override = None
+        price_list = money(self.selling_price, resolved_currency, override_amount=_override)
+        price_special = money(self.special_price, resolved_currency) if self.special_price is not None else None
+        price_display = money(display_price, resolved_currency,
+                              override_amount=_override if not is_on_special else None)
+        price_original = money(original_display_price, resolved_currency) if original_display_price is not None else None
+
+        def _scalar(block, fallback):
+            """The bare number for legacy callers: presentment when we have it."""
+            if in_base or not block:
+                return fallback
+            return float(block["amount"])
 
         # Process attributes to handle array format from variants
         def process_attributes(attributes):
@@ -146,11 +204,19 @@ class Product(BaseModel):
             "product_description": self.product_description,
             "cost_price": float(self.cost_price) if self.cost_price is not None else None,
 
-            # Merchant's standard GST-inclusive selling price
-            "selling_price": float(self.selling_price) if self.selling_price is not None else None,
+            # Merchant's standard GST-inclusive selling price.
+            # NOTE: when the caller asked for a presentment currency, this scalar is
+            # in THAT currency. `selling_price_inr` below is always INR.
+            "selling_price": _scalar(
+                price_list,
+                float(self.selling_price) if self.selling_price is not None else None,
+            ),
 
             # Merchant's special GST-inclusive price (if any)
-            "special_price": float(self.special_price) if self.special_price is not None else None,
+            "special_price": _scalar(
+                price_special,
+                float(self.special_price) if self.special_price is not None else None,
+            ),
             "special_start": self.special_start.isoformat() if self.special_start else None,
             "special_end": self.special_end.isoformat() if self.special_end else None,
             "is_on_special_offer": is_on_special,
@@ -178,10 +244,42 @@ class Product(BaseModel):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "deleted_at": self.deleted_at.isoformat() if self.deleted_at else None,
+            "deleted_by_role": self.deleted_by_role,
+            "deletion_reason": self.deletion_reason,
+            # So the merchant dashboard can say "removed by admin" rather than just
+            # showing a product that quietly stopped selling.
+            "removed_by_admin": self.deleted_at is not None and self.deleted_by_role == "admin",
 
             # Frontend pricing display
-            "price": float(display_price) if display_price is not None else 0.0,
-            "originalPrice": float(original_display_price) if original_display_price is not None else None,
+            "price": _scalar(
+                price_display,
+                float(display_price) if display_price is not None else 0.0,
+            ) or 0.0,
+            "originalPrice": _scalar(
+                price_original,
+                float(original_display_price) if original_display_price is not None else None,
+            ),
+
+            # --- Presentment (Phase 3) ---
+            # Present only when the caller opted in with ?currency=. Without it these
+            # keys are absent entirely and the response is byte-identical to before.
+            **({} if in_base else {
+                # Always INR, always safe to do book arithmetic on.
+                "selling_price_inr": float(self.selling_price) if self.selling_price is not None else None,
+                "special_price_inr": float(self.special_price) if self.special_price is not None else None,
+                "price_inr": float(display_price) if display_price is not None else 0.0,
+                # What currency the scalars above are actually in. May be INR even
+                # when USD was requested, if no usable FX rate exists.
+                "currency": (price_display or {}).get("currency"),
+                "price_source": (price_display or {}).get("source"),
+                # The shape new consumers should target.
+                "prices": {
+                    "list": price_list,
+                    "special": price_special,
+                    "display": price_display,
+                    "original": price_original,
+                },
+            }),
 
             # Attributes, Variants, Stock
             "attributes": [attr.serialize() for attr in self.product_attributes] if self.product_attributes else [],

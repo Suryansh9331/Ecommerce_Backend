@@ -1,14 +1,16 @@
 from flask import Blueprint, request, jsonify, current_app, send_file
 from auth.utils import super_admin_role_required
 from flask_jwt_extended import get_jwt_identity
-import cloudinary
-import cloudinary.uploader
+from services.s3_service import get_s3_service
 from common.database import db
 from marshmallow import ValidationError
 from models.brand import Brand
 from models.category import Category
 from models.attribute import Attribute
 from models.category_attribute import CategoryAttribute
+from models.product import Product
+from models.gst_rule import GSTRule
+from models.user_category_preference import UserCategoryPreference
 from sqlalchemy.exc import IntegrityError
 from http import HTTPStatus
 from datetime import datetime, timezone 
@@ -233,26 +235,16 @@ def create_category():
                 return jsonify({'message': f"Invalid icon file type. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"}), HTTPStatus.BAD_REQUEST
             
             try:
+                s3_service = get_s3_service()
+                upload_result = s3_service.upload_generic_asset(file)
+                icon_url_from_s3 = upload_result.get('url')
                 
-                upload_result = cloudinary.uploader.upload(
-                    file,
-                    folder="category_icons",  
-                    resource_type="image"
-                )
+                if not icon_url_from_s3:
+                    current_app.logger.error("S3 upload succeeded but no URL was returned.")
+                    return jsonify({'message': 'S3 upload succeeded but did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
                 
-                icon_url_from_cloudinary = upload_result.get('secure_url')
-                
-                if not icon_url_from_cloudinary:
-                   
-                    current_app.logger.error("Cloudinary upload succeeded but no secure_url was returned.")
-                    return jsonify({'message': 'Cloudinary upload succeeded but did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
-                
-                
-                category_data['icon_url'] = icon_url_from_cloudinary
+                category_data['icon_url'] = icon_url_from_s3
 
-            except cloudinary.exceptions.Error as e:
-                current_app.logger.error(f"Cloudinary upload failed: {e}")
-                return jsonify({'message': f"Cloudinary icon upload failed: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
             except Exception as e: 
                 current_app.logger.error(f"An error occurred during icon file upload: {e}")
                 return jsonify({'message': f"An error occurred during icon file upload: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
@@ -411,19 +403,42 @@ def update_category(cid):
                 return jsonify({'message': f'Invalid icon file type. Allowed: {ALLOWED_EXTENSIONS}'}), HTTPStatus.BAD_REQUEST
 
             try:
-                upload_result = cloudinary.uploader.upload(
-                    file,
-                    folder="category_icons",
-                    public_id=f"category_{cid}_{file.filename.rsplit('.', 1)[0]}",
-                    overwrite=True,
-                    resource_type="image"
-                )
-                new_url = upload_result.get('secure_url')
+                # Get existing category to delete old icon
+                # Category model uses category_id as primary key, not id
+                existing_category = Category.query.filter_by(category_id=cid).first()
+                if existing_category and existing_category.icon_url:
+                    try:
+                        s3_service = get_s3_service()
+                        s3_service.delete_generic_asset(existing_category.icon_url)
+                    except Exception as e:
+                        current_app.logger.warning(f"Failed to delete old category icon from S3: {str(e)}")
+                
+                # Ensure file pointer is at beginning
+                if hasattr(file, 'seek'):
+                    file.seek(0)
+                
+                # Upload new icon to S3
+                s3_service = get_s3_service()
+                upload_result = s3_service.upload_generic_asset(file)
+                new_url = upload_result.get('url')
                 if not new_url:
-                    raise ValueError("No secure_url from Cloudinary")
+                    raise ValueError("No URL from S3")
                 update_data['icon_url'] = new_url
+                
+                # Close file handle if possible (Flask FileStorage handles this, but being explicit)
+                if hasattr(file, 'close'):
+                    try:
+                        file.close()
+                    except:
+                        pass  # FileStorage might not allow explicit close
             except Exception as e:
-                current_app.logger.error(f"Cloudinary upload failed in update: {e}")
+                current_app.logger.error(f"S3 upload failed in update: {e}", exc_info=True)
+                # Ensure file is closed even on error
+                if hasattr(file, 'close'):
+                    try:
+                        file.close()
+                    except:
+                        pass
                 return jsonify({'message': f'Icon upload failed: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
     else:
         return jsonify({'message': 'Unsupported Content-Type. Use JSON or multipart/form-data.'}), HTTPStatus.UNSUPPORTED_MEDIA_TYPE
@@ -447,6 +462,53 @@ def update_category(cid):
         db.session.rollback()
         current_app.logger.error(f"Error updating category {cid}: {e}")
         return jsonify({'message': f'Could not update category: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@superadmin_bp.route('/categories/<int:cid>/active', methods=['PATCH'])
+@super_admin_role_required
+def set_category_active(cid):
+    """
+    Enable or disable a category. Disabling also sets active_flag=False on all products in this category and subcategories.
+    ---
+    tags:
+      - Categories
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: cid
+        type: integer
+        required: true
+        description: ID of the category
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [is_active]
+          properties:
+            is_active:
+              type: boolean
+              description: True to enable, False to disable
+    responses:
+      200:
+        description: Category active state updated
+      404:
+        description: Category not found
+    """
+    try:
+        data = request.get_json() or {}
+        is_active = data.get('is_active')
+        if is_active is None:
+            return jsonify({'message': 'is_active is required (true or false)'}), HTTPStatus.BAD_REQUEST
+        cat = CategoryController.set_active(cid, is_active)
+        return jsonify(cat.serialize()), HTTPStatus.OK
+    except FileNotFoundError:
+        return jsonify({'message': 'Category not found'}), HTTPStatus.NOT_FOUND
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error setting category {cid} active: {e}")
+        return jsonify({'message': 'Could not update category active state.'}), HTTPStatus.INTERNAL_SERVER_ERROR
 
 
 @superadmin_bp.route('/categories/<int:cid>', methods=['DELETE'])
@@ -502,14 +564,55 @@ def delete_category(cid):
         description: Internal server error
     """
     try:
+        # Category model uses category_id as primary key, not id
+        category = Category.query.filter_by(category_id=cid).first()
+        if not category:
+            return jsonify({'message': 'Category not found'}), HTTPStatus.NOT_FOUND
+
+        # Proactive checks: return clear errors instead of 500 / IntegrityError
+        product_count = Product.query.filter(
+            Product.category_id == cid,
+            Product.deleted_at.is_(None)
+        ).count()
+        if product_count > 0:
+            return jsonify({
+                'message': f'Cannot delete category: it has {product_count} product(s) assigned. Reassign or remove the products first.'
+            }), HTTPStatus.BAD_REQUEST
+
+        gst_rule = GSTRule.query.filter_by(category_id=cid).first()
+        if gst_rule:
+            return jsonify({
+                'message': 'Cannot delete category: it is used by a tax (GST) rule. Remove or reassign the tax rule first.'
+            }), HTTPStatus.BAD_REQUEST
+
+        pref_count = UserCategoryPreference.query.filter_by(category_id=cid).count()
+        if pref_count > 0:
+            return jsonify({
+                'message': 'Cannot delete category: it is referenced by user preferences. This is usually safe to ignore; try again or contact support if the error persists.'
+            }), HTTPStatus.BAD_REQUEST
+
+        # Get category to delete associated icon
+        if category.icon_url:
+            try:
+                s3_service = get_s3_service()
+                s3_service.delete_generic_asset(category.icon_url)
+            except Exception as e:
+                current_app.logger.warning(f"Failed to delete category icon from S3: {str(e)}")
+
         cat = CategoryController.delete(cid)
         return jsonify(cat.serialize()), HTTPStatus.OK
-    except FileNotFoundError: 
+    except FileNotFoundError:
         return jsonify({'message': 'Category not found'}), HTTPStatus.NOT_FOUND
+    except IntegrityError as e:
+        db.session.rollback()
+        current_app.logger.warning(f"IntegrityError deleting category {cid}: {e}")
+        return jsonify({
+            'message': 'Cannot delete category: it is still in use (e.g. by products, tax rules, or homepage). Remove those references first.'
+        }), HTTPStatus.BAD_REQUEST
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error deleting category {cid}: {e}")
-        return jsonify({'message': f'Could not delete category: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
+        return jsonify({'message': 'Could not delete category. Please try again or contact support.'}), HTTPStatus.INTERNAL_SERVER_ERROR
 
 
 @superadmin_bp.route('/categories/<int:cid>/upload_icon', methods=['POST'])
@@ -557,8 +660,8 @@ def upload_category_icon(cid):
         description: "Internal server error."
     """    
     try:
-        
-        category = Category.query.filter_by(id=cid).first()
+        # Category model uses category_id as primary key, not id
+        category = Category.query.filter_by(category_id=cid).first()
         if not category:
             return jsonify({'message': 'Category not found or has been deleted'}), HTTPStatus.NOT_FOUND
 
@@ -572,20 +675,22 @@ def upload_category_icon(cid):
         if not allowed_file(file.filename):
             return jsonify({'message': f"Invalid file type. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"}), HTTPStatus.BAD_REQUEST
 
-        public_id_for_cloudinary = f"category_icons/category_{cid}_{file.filename.rsplit('.', 1)[0]}"
+        # Delete old icon from S3 if it exists
+        if category.icon_url:
+            try:
+                s3_service = get_s3_service()
+                s3_service.delete_generic_asset(category.icon_url)
+            except Exception as e:
+                current_app.logger.warning(f"Failed to delete old category icon from S3: {str(e)}")
 
-        upload_result = cloudinary.uploader.upload(
-            file,
-            folder="category_icons",
-            public_id=public_id_for_cloudinary,
-            overwrite=True,
-            resource_type="image"
-        )
+        # Upload new icon to S3
+        s3_service = get_s3_service()
+        upload_result = s3_service.upload_generic_asset(file)
         
-        icon_url = upload_result.get('secure_url')
+        icon_url = upload_result.get('url')
         if not icon_url:
-            current_app.logger.error(f"Cloudinary upload for category {cid} succeeded but no secure_url.")
-            return jsonify({'message': 'Cloudinary did not return a URL'}), HTTPStatus.INTERNAL_SERVER_ERROR
+            current_app.logger.error(f"S3 upload for category {cid} succeeded but no URL.")
+            return jsonify({'message': 'S3 did not return a URL'}), HTTPStatus.INTERNAL_SERVER_ERROR
 
         category.icon_url = icon_url
        
@@ -595,10 +700,6 @@ def upload_category_icon(cid):
             'message': 'Icon uploaded and category updated successfully',
             'category': category.serialize()
         }), HTTPStatus.OK
-
-    except cloudinary.exceptions.Error as e:
-        current_app.logger.error(f"Cloudinary upload failed for category {cid}: {e}")
-        return jsonify({'message': f"Cloudinary upload failed: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
    
     except Exception as e:
         db.session.rollback()
@@ -743,18 +844,12 @@ def approve_brand_request(rid):
             if not allowed_file(file.filename):
                 return jsonify({'message': f"Invalid brand icon file type. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"}), HTTPStatus.BAD_REQUEST
             try:
-                upload_result = cloudinary.uploader.upload(
-                    file,
-                    folder="brand_icons",
-                    resource_type="image"
-                )
-                icon_url_from_cloudinary = upload_result.get('secure_url')
+                s3_service = get_s3_service()
+                upload_result = s3_service.upload_generic_asset(file)
+                icon_url_from_cloudinary = upload_result.get('url')
                 if not icon_url_from_cloudinary:
-                    current_app.logger.error(f"Cloudinary upload for brand request {rid} succeeded but no secure_url.")
-                    return jsonify({'message': 'Cloudinary upload succeeded but did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
-            except cloudinary.exceptions.Error as e:
-                current_app.logger.error(f"Cloudinary upload failed for brand request {rid}: {e}")
-                return jsonify({'message': f"Cloudinary icon upload failed: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
+                    current_app.logger.error(f"S3 upload for brand request {rid} succeeded but no URL.")
+                    return jsonify({'message': 'S3 upload succeeded but did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
             except Exception as e:
                 current_app.logger.error(f"Error during brand icon file upload for request {rid}: {e}")
                 return jsonify({'message': f"An error occurred during brand icon file upload: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1046,15 +1141,13 @@ def create_brand_directly():
             if not allowed_file(file.filename):
                 return jsonify({'message': f"Invalid icon file type. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"}), HTTPStatus.BAD_REQUEST
             try:
-                upload_result = cloudinary.uploader.upload(file, folder="brand_icons", resource_type="image")
-                icon_url_from_cloudinary = upload_result.get('secure_url')
-                if not icon_url_from_cloudinary:
-                    current_app.logger.error("Cloudinary brand icon upload (direct create) succeeded but no secure_url.")
-                    return jsonify({'message': 'Cloudinary upload did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
-                brand_data['icon_url'] = icon_url_from_cloudinary 
-            except cloudinary.exceptions.Error as e:
-                current_app.logger.error(f"Cloudinary icon upload failed (direct brand create): {e}")
-                return jsonify({'message': f"Cloudinary icon upload failed: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
+                s3_service = get_s3_service()
+                upload_result = s3_service.upload_generic_asset(file)
+                icon_url_from_s3 = upload_result.get('url')
+                if not icon_url_from_s3:
+                    current_app.logger.error("S3 brand icon upload (direct create) succeeded but no URL.")
+                    return jsonify({'message': 'S3 upload did not return a URL.'}), HTTPStatus.INTERNAL_SERVER_ERROR
+                brand_data['icon_url'] = icon_url_from_s3 
             except Exception as e:
                 current_app.logger.error(f"An error occurred during icon file upload (direct brand create): {e}")
                 return jsonify({'message': f"An error occurred during icon file upload: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1133,20 +1226,22 @@ def upload_brand_icon(bid):
         if not allowed_file(file.filename):
             return jsonify({'message': f"Invalid file type. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"}), HTTPStatus.BAD_REQUEST
 
-        public_id_for_cloudinary = f"brand_icons/brand_{bid}_{file.filename.rsplit('.', 1)[0]}"
+        # Delete old icon from S3 if it exists
+        if brand.icon_url:
+            try:
+                s3_service = get_s3_service()
+                s3_service.delete_generic_asset(brand.icon_url)
+            except Exception as e:
+                current_app.logger.warning(f"Failed to delete old brand icon from S3: {str(e)}")
 
-        upload_result = cloudinary.uploader.upload(
-            file,
-            folder="brand_icons",
-            public_id=public_id_for_cloudinary,
-            overwrite=True,
-            resource_type="image"
-        )
+        # Upload new icon to S3
+        s3_service = get_s3_service()
+        upload_result = s3_service.upload_generic_asset(file)
         
-        icon_url = upload_result.get('secure_url')
+        icon_url = upload_result.get('url')
         if not icon_url:
-            current_app.logger.error(f"Cloudinary upload for brand {bid} succeeded but no secure_url.")
-            return jsonify({'message': 'Cloudinary did not return a URL'}), HTTPStatus.INTERNAL_SERVER_ERROR
+            current_app.logger.error(f"S3 upload for brand {bid} succeeded but no URL.")
+            return jsonify({'message': 'S3 did not return a URL'}), HTTPStatus.INTERNAL_SERVER_ERROR
 
         brand.icon_url = icon_url
         db.session.add(brand)
@@ -1156,10 +1251,6 @@ def upload_brand_icon(bid):
             'message': 'Brand icon uploaded and updated successfully',
             'brand': brand.serialize()
         }), HTTPStatus.OK
-
-    except cloudinary.exceptions.Error as e:
-        current_app.logger.error(f"Cloudinary upload failed for brand {bid}: {e}")
-        return jsonify({'message': f"Cloudinary upload failed: {str(e)}"}), HTTPStatus.INTERNAL_SERVER_ERROR
     except Exception as e:
         db.session.rollback()
         current_app.logger.error(f"Error uploading icon for brand {bid}: {e}")
@@ -1276,19 +1367,24 @@ def update_brand(bid):
                 return jsonify({'message': f'Invalid icon file type. Allowed: {ALLOWED_EXTENSIONS}'}), HTTPStatus.BAD_REQUEST
 
             try:
-                upload_result = cloudinary.uploader.upload(
-                    file,
-                    folder="brand_icons",
-                    public_id=f"brand_{bid}_{file.filename.rsplit('.', 1)[0]}",
-                    overwrite=True,
-                    resource_type="image"
-                )
-                new_url = upload_result.get('secure_url')
+                # Get existing brand to delete old icon
+                existing_brand = Brand.query.filter_by(brand_id=bid).first()
+                if existing_brand and existing_brand.icon_url:
+                    try:
+                        s3_service = get_s3_service()
+                        s3_service.delete_generic_asset(existing_brand.icon_url)
+                    except Exception as e:
+                        current_app.logger.warning(f"Failed to delete old brand icon from S3: {str(e)}")
+                
+                # Upload new icon to S3
+                s3_service = get_s3_service()
+                upload_result = s3_service.upload_generic_asset(file)
+                new_url = upload_result.get('url')
                 if not new_url:
-                    raise ValueError("No secure_url from Cloudinary")
+                    raise ValueError("No URL from S3")
                 update_data['icon_url'] = new_url
             except Exception as e:
-                current_app.logger.error(f"Cloudinary upload failed in update: {e}")
+                current_app.logger.error(f"S3 upload failed in update: {e}")
                 return jsonify({'message': f'Icon upload failed: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
     else:
         return jsonify({'message': 'Unsupported Content-Type. Use JSON or multipart/form-data.'}), HTTPStatus.UNSUPPORTED_MEDIA_TYPE
@@ -1342,6 +1438,15 @@ def delete_brand(bid):
         description: Internal server error
     """
     try:
+        # Get brand to delete associated icon
+        brand = Brand.query.filter_by(brand_id=bid).first()
+        if brand and brand.icon_url:
+            try:
+                s3_service = get_s3_service()
+                s3_service.delete_generic_asset(brand.icon_url)
+            except Exception as e:
+                current_app.logger.warning(f"Failed to delete brand icon from S3: {str(e)}")
+        
         BrandController.delete(bid)
         return '', HTTPStatus.NO_CONTENT
     except Exception as e:
@@ -3853,6 +3958,12 @@ def carousels_handler():
         type: string
         required: false
         description: Optional shareable link for the carousel
+      - in: formData
+        name: orientation
+        type: string
+        required: false
+        default: horizontal
+        description: Banner orientation - 'horizontal' for main carousel (1920x450px) or 'vertical' for side banners (368x564px)
     responses:
       200:
         description: List of carousels retrieved successfully
@@ -3875,6 +3986,8 @@ def carousels_handler():
                 type: boolean
               shareable_link:
                 type: string
+              orientation:
+                type: string
       201:
         description: Carousel created successfully
         schema:
@@ -3893,7 +4006,9 @@ def carousels_handler():
             is_active:
               type: boolean
             shareable_link:
-              type: string
+                type: string
+            orientation:
+                type: string
       400:
         description: Missing required fields
       500:
@@ -3907,21 +4022,62 @@ def carousels_handler():
         return '', HTTPStatus.OK
     if request.method == 'GET':
         try:
-            carousels = CarouselController.list_all()
-            return jsonify([
-                {
-                    'id': c.id,
-                    'type': c.type,
-                    'image_url': c.image_url,
-                    'target_id': c.target_id,
-                    'display_order': c.display_order,
-                    'is_active': c.is_active,
-                    'shareable_link': c.shareable_link
-                } for c in carousels
-            ]), HTTPStatus.OK
+            # Get orientation filter from query parameter
+            orientation = request.args.get('orientation')
+            carousels = CarouselController.list_all(orientation=orientation)
+            
+            # Serialize carousels with error handling
+            result = []
+            for c in carousels:
+                try:
+                    # Try to get orientation, default to 'horizontal' if column doesn't exist
+                    carousel_orientation = getattr(c, 'orientation', 'horizontal')
+                    result.append({
+                        'id': c.id,
+                        'type': c.type,
+                        'orientation': carousel_orientation,
+                        'image_url': c.image_url,
+                        'target_id': c.target_id,
+                        'display_order': c.display_order,
+                        'is_active': c.is_active,
+                        'shareable_link': c.shareable_link
+                    })
+                except Exception as serialize_error:
+                    current_app.logger.error(
+                        f"Error serializing carousel {c.id}: {str(serialize_error)}",
+                        exc_info=True
+                    )
+                    # Try basic serialization without orientation
+                    try:
+                        result.append({
+                            'id': c.id,
+                            'type': c.type,
+                            'orientation': 'horizontal',  # Default value
+                            'image_url': c.image_url,
+                            'target_id': c.target_id,
+                            'display_order': c.display_order,
+                            'is_active': c.is_active,
+                            'shareable_link': c.shareable_link
+                        })
+                    except Exception as basic_error:
+                        current_app.logger.error(
+                            f"Error in basic serialization for carousel {c.id}: {str(basic_error)}",
+                            exc_info=True
+                        )
+                        # Skip this carousel if serialization fails completely
+                        continue
+            
+            return jsonify(result), HTTPStatus.OK
         except Exception as e:
-            current_app.logger.error(f"Error listing carousels: {e}")
-            return jsonify({'message': 'Failed to retrieve carousels.'}), HTTPStatus.INTERNAL_SERVER_ERROR
+            current_app.logger.error(
+                f"Error listing carousels: {str(e)}",
+                exc_info=True
+            )
+            return jsonify({
+                'message': 'Failed to retrieve carousels.',
+                'error': str(e),
+                'error_type': type(e).__name__
+            }), HTTPStatus.INTERNAL_SERVER_ERROR
     if request.method == 'POST':
         try:
             # Accept multipart/form-data
@@ -3930,12 +4086,19 @@ def carousels_handler():
             shareable_link = request.form.get('shareable_link')
             display_order = request.form.get('display_order', 0)
             is_active = request.form.get('is_active', 'true').lower() == 'true'
+            orientation = request.form.get('orientation', 'horizontal')  # Default to horizontal
             image_file = request.files.get('image')
+            
+            # Validate orientation
+            if orientation not in ['horizontal', 'vertical']:
+                return jsonify({'message': 'orientation must be either "horizontal" or "vertical".'}), HTTPStatus.BAD_REQUEST
+            
             if not type_ or not target_id or not image_file:
                 return jsonify({'message': 'type, target_id, and image are required.'}), HTTPStatus.BAD_REQUEST
             data = {
                 'type': type_,
                 'target_id': int(target_id),
+                'orientation': orientation,
                 'display_order': int(display_order),
                 'is_active': is_active,
                 'shareable_link': shareable_link
@@ -6076,3 +6239,300 @@ def shop_analytics_export():
   except Exception as e:
     current_app.logger.error(f"Shop analytics export error: {e}")
     return jsonify({'status': 'error', 'message': 'Failed to export report'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+# --------------------------------------------------------------------------- #
+# Merchant intro video moderation
+#
+# Inert while MERCHANT_INTRO_VIDEO_MODERATION_ENABLED is false (uploads are
+# auto-approved), but shipped now so flipping the flag needs no code change.
+# --------------------------------------------------------------------------- #
+
+@superadmin_bp.route('/merchant-intro-videos', methods=['GET'])
+@super_admin_role_required
+def list_merchant_intro_videos():
+    """List merchant intro videos, newest first, filterable by moderation status."""
+    try:
+        from models.merchant_intro_video import MerchantIntroVideo
+        from auth.models.models import MerchantProfile
+
+        moderation_status = request.args.get('moderation_status')
+        page = request.args.get('page', 1, type=int)
+        per_page = min(request.args.get('per_page', 20, type=int), 100)
+
+        query = MerchantIntroVideo.query.filter(MerchantIntroVideo.deleted_at.is_(None))
+        if moderation_status:
+            query = query.filter(MerchantIntroVideo.moderation_status == moderation_status)
+
+        pagination = query.order_by(MerchantIntroVideo.created_at.desc()).paginate(
+            page=page, per_page=per_page, error_out=False
+        )
+
+        items = []
+        for video in pagination.items:
+            data = video.serialize(owner_view=True)
+            merchant = MerchantProfile.get_by_id(video.merchant_id)
+            data['merchant'] = {
+                'merchant_id': video.merchant_id,
+                'business_name': merchant.business_name if merchant else None,
+                'username': merchant.username if merchant else None,
+            }
+            items.append(data)
+
+        return jsonify({
+            'intro_videos': items,
+            'pagination': {
+                'page': pagination.page,
+                'per_page': pagination.per_page,
+                'total': pagination.total,
+                'pages': pagination.pages,
+            },
+        }), HTTPStatus.OK
+    except Exception as e:
+        current_app.logger.error(f"List merchant intro videos error: {e}", exc_info=True)
+        return jsonify({'error': 'Failed to list intro videos'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@superadmin_bp.route('/merchant-intro-videos/<int:video_id>/approve', methods=['POST'])
+@super_admin_role_required
+def approve_merchant_intro_video(video_id):
+    """Approve a merchant intro video, making it publicly visible."""
+    from controllers.merchant.merchant_intro_video_controller import (
+        MerchantIntroVideoController,
+        IntroVideoError,
+    )
+    try:
+        video = MerchantIntroVideoController.moderate(
+            video_id, approve=True, admin_user_id=get_jwt_identity(),
+            notes=(request.get_json(silent=True) or {}).get('notes'),
+        )
+    except IntroVideoError as e:
+        body = {'error': e.message}
+        if e.details:
+            body['details'] = e.details
+        return jsonify(body), e.status_code
+    return jsonify({
+        'message': 'Intro video approved',
+        'intro_video': video.serialize(owner_view=True),
+    }), HTTPStatus.OK
+
+
+@superadmin_bp.route('/merchant-intro-videos/<int:video_id>/reject', methods=['POST'])
+@super_admin_role_required
+def reject_merchant_intro_video(video_id):
+    """Reject a merchant intro video. A reason is required and shown to the merchant."""
+    from controllers.merchant.merchant_intro_video_controller import (
+        MerchantIntroVideoController,
+        IntroVideoError,
+    )
+    data = request.get_json(silent=True) or {}
+    try:
+        video = MerchantIntroVideoController.moderate(
+            video_id, approve=False, admin_user_id=get_jwt_identity(),
+            notes=data.get('reason') or data.get('notes'),
+        )
+    except IntroVideoError as e:
+        body = {'error': e.message}
+        if e.details:
+            body['details'] = e.details
+        return jsonify(body), e.status_code
+    return jsonify({
+        'message': 'Intro video rejected',
+        'intro_video': video.serialize(owner_view=True),
+    }), HTTPStatus.OK
+
+
+# --- Product takedown -------------------------------------------------------
+
+@superadmin_bp.route('/products/<int:product_id>', methods=['DELETE'])
+@super_admin_role_required
+def superadmin_delete_product(product_id):
+    """Remove a single merchant product from the marketplace.
+
+    Soft delete: order history references products and must keep rendering.
+    ---
+    tags:
+      - Product Monitoring
+    """
+    from controllers.superadmin.product_deletion_controller import (
+        ProductDeletionError, delete_products,
+    )
+
+    data = request.get_json(silent=True) or {}
+    try:
+        result = delete_products(
+            [product_id],
+            admin_user_id=get_jwt_identity(),
+            reason=data.get('reason'),
+        )
+    except ProductDeletionError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
+    if result['deleted_count'] == 0:
+        why = result['skipped'][0]['reason'] if result['skipped'] else 'not found'
+        return jsonify({'status': 'error', 'message': f'Product {why}.'}), 404
+
+    return jsonify({
+        'status': 'success',
+        'message': 'Product removed and the merchant has been notified.',
+        'data': result,
+    }), 200
+
+
+@superadmin_bp.route('/products/bulk-delete', methods=['POST'])
+@super_admin_role_required
+def superadmin_bulk_delete_products():
+    """Remove several products at once.
+
+    Reports per-product outcomes rather than a single verdict: selecting 40 where
+    2 were already gone should read as 38 removed and 2 skipped.
+    ---
+    tags:
+      - Product Monitoring
+    """
+    from controllers.superadmin.product_deletion_controller import (
+        ProductDeletionError, delete_products,
+    )
+
+    data = request.get_json(silent=True) or {}
+    ids = data.get('product_ids')
+    if not isinstance(ids, list):
+        return jsonify({'status': 'error',
+                        'message': 'product_ids must be a list.'}), 400
+
+    try:
+        result = delete_products(
+            ids,
+            admin_user_id=get_jwt_identity(),
+            reason=data.get('reason'),
+        )
+    except ProductDeletionError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
+    return jsonify({
+        'status': 'success',
+        'message': (
+            f"{result['deleted_count']} product(s) removed"
+            + (f", {result['skipped_count']} skipped" if result['skipped_count'] else "")
+            + "."
+        ),
+        'data': result,
+    }), 200
+
+
+# --------------------------------------------------------------------------- #
+# Plinko lead-capture game
+#
+# Mounted on superadmin_bp, so these live under /api/superadmin/plinko/... and
+# need no change in app.py.
+# --------------------------------------------------------------------------- #
+from controllers.superadmin.plinko_admin_controller import PlinkoAdminController
+
+
+def _plinko_filters():
+    """Query-string filters shared by the list and the export."""
+    def _parse_date(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00')).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    return {
+        'status': request.args.get('status'),
+        'campaign_id': request.args.get('campaign_id', type=int),
+        'search': request.args.get('search'),
+        'date_from': _parse_date(request.args.get('date_from')),
+        'date_to': _parse_date(request.args.get('date_to')),
+        'sort_by': request.args.get('sort_by', '-created_at'),
+    }
+
+
+@superadmin_bp.route('/plinko/leads', methods=['GET'])
+@super_admin_role_required
+def list_plinko_leads():
+    """Captured leads, newest first, with what became of each coupon."""
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = min(request.args.get('per_page', 20, type=int), 200)
+        paginated = PlinkoAdminController.list_leads(
+            page=page, per_page=per_page, **_plinko_filters()
+        )
+        return jsonify({
+            'leads': [PlinkoAdminController.serialize_lead(l) for l in paginated.items],
+            'pagination': {
+                'total_items': paginated.total,
+                'total_pages': paginated.pages,
+                'current_page': paginated.page,
+                'per_page': paginated.per_page,
+                'has_next': paginated.has_next,
+                'has_prev': paginated.has_prev,
+            },
+        }), HTTPStatus.OK
+    except Exception as e:
+        current_app.logger.error(f"Error listing plinko leads: {e}", exc_info=True)
+        return jsonify({'message': 'Failed to retrieve leads'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@superadmin_bp.route('/plinko/leads/export', methods=['GET'])
+@super_admin_role_required
+def export_plinko_leads():
+    try:
+        data, mimetype, filename = PlinkoAdminController.export_csv(**_plinko_filters())
+        return send_file(BytesIO(data), mimetype=mimetype,
+                         as_attachment=True, download_name=filename)
+    except Exception as e:
+        current_app.logger.error(f"Error exporting plinko leads: {e}", exc_info=True)
+        return jsonify({'message': 'Failed to export leads'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@superadmin_bp.route('/plinko/stats', methods=['GET'])
+@super_admin_role_required
+def plinko_stats():
+    try:
+        return jsonify(PlinkoAdminController.stats(
+            campaign_id=request.args.get('campaign_id', type=int)
+        )), HTTPStatus.OK
+    except Exception as e:
+        current_app.logger.error(f"Error building plinko stats: {e}", exc_info=True)
+        return jsonify({'message': 'Failed to retrieve stats'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@superadmin_bp.route('/plinko/campaigns', methods=['GET'])
+@super_admin_role_required
+def list_plinko_campaigns():
+    try:
+        return jsonify(PlinkoAdminController.list_campaigns()), HTTPStatus.OK
+    except Exception as e:
+        current_app.logger.error(f"Error listing plinko campaigns: {e}", exc_info=True)
+        return jsonify({'message': 'Failed to retrieve campaigns'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@superadmin_bp.route('/plinko/campaigns', methods=['POST'])
+@super_admin_role_required
+def create_plinko_campaign():
+    try:
+        return jsonify(PlinkoAdminController.save_campaign(request.get_json() or {})), \
+            HTTPStatus.CREATED
+    except ValueError as e:
+        return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error creating plinko campaign: {e}", exc_info=True)
+        return jsonify({'message': 'Failed to create campaign'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@superadmin_bp.route('/plinko/campaigns/<int:campaign_id>', methods=['PUT'])
+@super_admin_role_required
+def update_plinko_campaign(campaign_id):
+    try:
+        return jsonify(PlinkoAdminController.save_campaign(
+            request.get_json() or {}, campaign_id=campaign_id
+        )), HTTPStatus.OK
+    except ValueError as e:
+        return jsonify({'message': str(e)}), HTTPStatus.NOT_FOUND
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Error updating plinko campaign: {e}", exc_info=True)
+        return jsonify({'message': 'Failed to update campaign'}), HTTPStatus.INTERNAL_SERVER_ERROR

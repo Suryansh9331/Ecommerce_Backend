@@ -1,10 +1,11 @@
 from flask import current_app
 from models.product_placement import ProductPlacement, PlacementTypeEnum
 from models.product import Product
+from services.currency_context import apply_presentment_prices
 from models.product_media import ProductMedia, MediaType
 from common.database import db
 from datetime import datetime, timezone
-from sqlalchemy import desc, and_, or_
+from sqlalchemy import desc, and_, or_, case, func
 
 class FeatureProductController:
     @staticmethod
@@ -134,6 +135,13 @@ class FeatureProductController:
                 product_data['selling_price'] = selling_price
                 product_data['special_price'] = special_price
                 product_data['discount_pct'] = discount_pct
+
+                # The assignments above are raw INR columns and have just discarded
+                # what serialize() computed. Re-price them for the requested currency.
+                apply_presentment_prices(
+                    product_data, price=current_price, original_price=original_price,
+                    selling_price=selling_price, special_price=special_price,
+                )
                 
                 serialized_products.append(product_data)
 
@@ -232,10 +240,101 @@ class FeatureProductController:
             product_data['special_price'] = special_price
             product_data['discount_pct'] = discount_pct
 
+            # These are raw INR columns; re-price them for the requested currency.
+            apply_presentment_prices(
+                product_data, price=current_price, original_price=original_price,
+                selling_price=selling_price, special_price=special_price,
+            )
+
             return product_data
 
         except ValueError as e:
             raise e
         except Exception as e:
             current_app.logger.error(f"Error getting featured product details: {str(e)}")
-            raise RuntimeError("Failed to retrieve featured product details") from e 
+            raise RuntimeError("Failed to retrieve featured product details") from e
+
+    @staticmethod
+    def get_heavy_discount_products(limit=4):
+        """
+        Get the top N products with the highest discount % from all AOIN products (global catalog).
+        Same product source as featured products (Product model), ordered by effective discount % desc.
+        Effective discount: active special offer -> (selling_price - special_price)/selling_price*100; else discount_pct.
+        """
+        try:
+            limit = min(max(1, limit), 20)
+            today = datetime.now(timezone.utc).date()
+
+            special_active = and_(
+                Product.special_price.isnot(None),
+                or_(Product.special_start.is_(None), Product.special_start <= today),
+                or_(Product.special_end.is_(None), Product.special_end >= today),
+                Product.selling_price > 0
+            )
+            effective_discount_pct = case(
+                (special_active, (Product.selling_price - Product.special_price) / Product.selling_price * 100),
+                else_=func.coalesce(Product.discount_pct, 0)
+            )
+
+            products = Product.query.filter(
+                Product.deleted_at.is_(None),
+                Product.active_flag.is_(True),
+                Product.approval_status == 'approved',
+                Product.parent_product_id.is_(None)
+            ).order_by(desc(effective_discount_pct)).limit(limit).all()
+
+            serialized_products = []
+            for product in products:
+                product_data = product.serialize()
+
+                media = ProductMedia.query.filter_by(
+                    product_id=product.product_id,
+                    deleted_at=None
+                ).order_by(ProductMedia.sort_order.asc()).all()
+                product_data['images'] = [m.url for m in media if m.type == MediaType.IMAGE]
+                product_data['primary_image'] = product_data['images'][0] if product_data.get('images') else None
+
+                selling_price = getattr(product, 'selling_price', 0)
+                special_price = getattr(product, 'special_price', None)
+                discount_pct = getattr(product, 'discount_pct', None)
+                # Convert to float to avoid Decimal/float operand errors
+                sp = float(selling_price) if selling_price is not None else 0.0
+                spp = float(special_price) if special_price is not None else None
+                current_price = spp if spp is not None else sp
+
+                if special_price is not None and sp > (spp or 0):
+                    original_price = sp
+                    product_data['discount_pct'] = round((sp - spp) / sp * 100, 2) if spp is not None else 0.0
+                elif discount_pct and float(discount_pct) > 0 and current_price is not None:
+                    d = float(discount_pct) / 100
+                    original_price = current_price / (1 - d)
+                    product_data['discount_pct'] = float(discount_pct)
+                else:
+                    original_price = current_price
+                    product_data['discount_pct'] = float(discount_pct) if discount_pct is not None else 0.0
+
+                product_data['price'] = float(current_price) if current_price is not None else 0.0
+                product_data['originalPrice'] = float(original_price) if original_price is not None else None
+                product_data['selling_price'] = sp
+                product_data['special_price'] = spp
+
+                # Same as above: these are INR, re-price them for the request.
+                apply_presentment_prices(
+                    product_data, price=current_price, original_price=original_price,
+                    selling_price=sp, special_price=spp,
+                )
+
+                serialized_products.append(product_data)
+
+            return {
+                'products': serialized_products,
+                'pagination': {
+                    'total': len(serialized_products),
+                    'pages': 1,
+                    'current_page': 1,
+                    'per_page': limit
+                }
+            }
+        except Exception as e:
+            current_app.logger.exception("Error getting heavy discount products: %s", str(e))
+            raise

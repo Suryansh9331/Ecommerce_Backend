@@ -1,4 +1,5 @@
 import jwt
+import re
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import request, jsonify, current_app
@@ -57,22 +58,45 @@ def role_required(required_roles):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            # Verify JWT token
-            verify_jwt_in_request()
+            # Add logging for media uploads
+            if '/products/' in request.path and '/media' in request.path:
+                print(f"[ROLE_CHECK] Starting role check for {request.method} {request.path}")
             
-            # Get current user identity
-            current_user_id = get_jwt_identity()
-            
-            # Get user from database
-            user = User.get_by_id(current_user_id)
-            if not user:
-                return jsonify({"error": "User not found"}), 404
-            
-            # Check if user has required role
-            if user.role.value not in required_roles:
-                return jsonify({"error": "Insufficient permissions"}), 403
-            
-            return fn(*args, **kwargs)
+            try:
+                # Verify JWT token
+                verify_jwt_in_request()
+                if '/products/' in request.path and '/media' in request.path:
+                    print(f"[ROLE_CHECK] JWT verified")
+                
+                # Get current user identity
+                current_user_id = get_jwt_identity()
+                if '/products/' in request.path and '/media' in request.path:
+                    print(f"[ROLE_CHECK] User ID: {current_user_id}")
+                
+                # Get user from database
+                user = User.get_by_id(current_user_id)
+                if not user:
+                    if '/products/' in request.path and '/media' in request.path:
+                        print(f"[ROLE_CHECK] User not found")
+                    return jsonify({"error": "User not found"}), 404
+
+                if not user.is_active:
+                    return jsonify({"error": "Account is disabled"}), 403
+                
+                # Check if user has required role
+                if user.role.value not in required_roles:
+                    if '/products/' in request.path and '/media' in request.path:
+                        print(f"[ROLE_CHECK] Insufficient permissions. User role: {user.role.value}, Required: {required_roles}")
+                    return jsonify({"error": "Insufficient permissions"}), 403
+                
+                if '/products/' in request.path and '/media' in request.path:
+                    print(f"[ROLE_CHECK] Role check passed, calling function")
+                
+                return fn(*args, **kwargs)
+            except Exception as e:
+                if '/products/' in request.path and '/media' in request.path:
+                    print(f"[ROLE_CHECK] Error in role check: {e}")
+                raise
         return wrapper
     return decorator
 
@@ -82,7 +106,16 @@ def user_role_required(fn):
 
 def merchant_role_required(fn):
     """Decorator for endpoints that require merchant role."""
-    return role_required([UserRole.MERCHANT.value])(fn)
+    decorated_fn = role_required([UserRole.MERCHANT.value])(fn)
+    
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Add logging to see if decorator is being called
+        if '/products/' in request.path and '/media' in request.path:
+            print(f"[DECORATOR] merchant_role_required called for {request.method} {request.path}")
+        # Call the decorated function
+        return decorated_fn(*args, **kwargs)
+    return wrapper
 
 def admin_role_required(fn):
     """Decorator for endpoints that require admin role."""
@@ -92,11 +125,22 @@ def super_admin_role_required(fn):
     """Decorator for endpoints that require super admin role."""
     return role_required([UserRole.SUPER_ADMIN.value])(fn)
 
+
+def creator_role_required(fn):
+    """Decorator for endpoints that require creator role."""
+    return role_required([UserRole.CREATOR.value])(fn)
+
 def get_google_provider_cfg():
     """Get Google OAuth provider configuration."""
     import requests
     try:
-        return requests.get(current_app.config['GOOGLE_DISCOVERY_URL']).json()
+        return requests.get(current_app.config['GOOGLE_DISCOVERY_URL'], timeout=10).json()
+    except requests.exceptions.Timeout:
+        current_app.logger.error(f"External API timeout: {current_app.config['GOOGLE_DISCOVERY_URL']}")
+        return None
+    except requests.exceptions.RequestException as e:
+        current_app.logger.error(f"External API error: {current_app.config['GOOGLE_DISCOVERY_URL']} - {str(e)}")
+        return None
     except Exception as e:
         current_app.logger.error(f"Error fetching Google provider config: {str(e)}")
         return None
@@ -129,4 +173,59 @@ def validate_google_token(token):
 def get_super_admin_emails():
     """Get email addresses of all active super admins."""
     super_admins = User.query.filter_by(role=UserRole.SUPER_ADMIN, is_active=True).all()
-    return [admin.email for admin in super_admins if admin.email]    
+    return [admin.email for admin in super_admins if admin.email]
+
+def normalize_phone_number(phone):
+    """Normalize phone number to E.164 format."""
+    if not phone:
+        return None
+    
+    # Remove all non-digit characters except +
+    phone = re.sub(r'[^\d+]', '', phone)
+    
+    # If phone doesn't start with +, assume it needs country code
+    # For now, we'll require + prefix. Frontend should handle country code selection
+    if not phone.startswith('+'):
+        # If it's a 10-digit number, assume it's missing country code
+        # You might want to add country code detection logic here
+        return None
+    
+    # Validate E.164 format: + followed by 1-15 digits
+    if not re.match(r'^\+\d{1,15}$', phone):
+        return None
+    
+    return phone
+
+def validate_phone_number(phone):
+    """Validate phone number format."""
+    if not phone:
+        return False
+    
+    normalized = normalize_phone_number(phone)
+    return normalized is not None    
+
+
+def is_apple_review_test_phone(phone_e164: str) -> bool:
+    """
+    True if phone's last 10 digits match a 5-5 repeated pattern, e.g. 1111122222, 4444488888.
+    Uses last-10-digits so it works with any country code in E.164.
+    """
+    if not phone_e164:
+        return False
+    digits = re.sub(r"\D", "", str(phone_e164))
+    if len(digits) < 10:
+        return False
+    last10 = digits[-10:]
+    return re.match(r"^(\d)\1{4}(\d)\2{4}$", last10) is not None
+
+
+def get_apple_review_fixed_otp() -> str:
+    """
+    Returns the configured fixed OTP for Apple review bypass (always 6 digits).
+    Falls back to '123456' if misconfigured.
+    """
+    raw = current_app.config.get("APPLE_REVIEW_OTP_CODE", "123456")
+    otp = re.sub(r"\D", "", str(raw))
+    if len(otp) != 6:
+        return "123456"
+    return otp

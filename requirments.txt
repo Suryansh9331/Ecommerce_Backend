@@ -11,7 +11,9 @@ redis
 marshmallow
 bcrypt
 PyJWT
+waitress
 gunicorn
+waitress
 pytest
 Flask-Caching
 cloudinary
@@ -45,3 +47,6 @@ pytesseract
 Pillow
 requests
 apscheduler
+twilio
+pytz
+python-dateutil

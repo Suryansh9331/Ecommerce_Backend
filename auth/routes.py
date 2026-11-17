@@ -6,7 +6,11 @@ from auth.controllers import (
     register_user, register_merchant, login_user, refresh_access_token,
     logout_user, verify_email, google_auth, get_current_user,
     request_password_reset, reset_password,
-    resend_verification_email_controller
+    resend_verification_email_controller,
+    send_phone_otp, verify_phone_otp_signup, verify_phone_otp_login,
+    creator_signup_request, creator_resend_otp, creator_verify_otp,
+    verify_merchant_email_otp, resend_merchant_email_otp,
+    verify_user_email_otp, resend_user_email_otp
 )
 from auth.utils import user_role_required, merchant_role_required, admin_role_required
 from auth.models import User, MerchantProfile
@@ -20,22 +24,32 @@ class RegisterUserSchema(Schema):
     first_name = fields.Str(required=True)
     last_name = fields.Str(required=True)
     phone = fields.Str()
+    # Registration origin: "app" -> email OTP verification; "web"/omitted -> email link.
+    # Declared here because marshmallow rejects unknown fields by default (RAISE).
+    source = fields.Str(load_only=True, required=False, validate=validate.OneOf(["web", "app"]))
 
 class RegisterMerchantSchema(Schema):
     password = fields.Str(required=True, validate=validate.Length(min=8))
     first_name = fields.Str(required=True)
     last_name = fields.Str(required=True)
     phone = fields.Str()
+    username = fields.Str(required=False, validate=validate.Regexp(r'^[a-zA-Z0-9_]{3,30}$', error="Username must be 3-30 characters, alphanumeric and underscores only"))
     business_name = fields.Str(required=True)
     business_description = fields.Str()
     business_email = fields.Email(required=True)
-    business_phone = fields.Str()
+    business_phone = fields.Str(required=True, validate=[
+        validate.Length(min=10, max=30, error="Business phone must be between 10 and 30 characters"),
+        validate.Regexp(r'^[\d\s\+\-\(\)]+$', error="Business phone must contain only digits, spaces, +, -, and parentheses")
+    ])
     business_address = fields.Str()
     country_code = fields.Str(required=True, validate=validate.OneOf([c.value for c in CountryCode]))
     state_province = fields.Str(required=True)
     city = fields.Str(required=True)
     postal_code = fields.Str(required=True)
     role = fields.Str(load_only=True)
+    # Registration origin: "app" -> email OTP verification; "web"/omitted -> email link.
+    # Declared here because marshmallow rejects unknown fields by default (RAISE).
+    source = fields.Str(load_only=True, required=False, validate=validate.OneOf(["web", "app"]))
 
 class LoginSchema(Schema):
     email = fields.Email(required=False)
@@ -59,6 +73,35 @@ class PasswordResetRequestSchema(Schema):
 class PasswordResetSchema(Schema):
     token = fields.Str(required=True)
     new_password = fields.Str(required=True, validate=validate.Length(min=8))
+
+class SendPhoneOTPSchema(Schema):
+    phone = fields.Str(required=True)
+
+class VerifyPhoneSignupSchema(Schema):
+    phone = fields.Str(required=True)
+    otp = fields.Str(required=True, validate=validate.Length(equal=6))
+    first_name = fields.Str(required=True)
+    last_name = fields.Str(required=True)
+
+class VerifyPhoneLoginSchema(Schema):
+    phone = fields.Str(required=True)
+    otp = fields.Str(required=True, validate=validate.Length(equal=6))
+
+
+class CreatorSignupRequestSchema(Schema):
+    first_name = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+    last_name = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+    email = fields.Email(required=True)
+    phone = fields.Str(required=True)
+
+
+class CreatorResendOtpSchema(Schema):
+    phone = fields.Str(required=True)
+
+
+class CreatorVerifyOtpSchema(Schema):
+    phone = fields.Str(required=True)
+    otp = fields.Str(required=True, validate=validate.Length(equal=6))
 
 # Create auth blueprint
 auth_bp = Blueprint('auth', __name__)
@@ -437,18 +480,26 @@ def login():
         description: Internal server error
     """
     try:
+        current_app.logger.info(f"Login request received - IP: {request.remote_addr}, User-Agent: {request.headers.get('User-Agent', 'Unknown')}")
+        
         # Validate request data
         schema = LoginSchema()
         data = schema.load(request.json)
+        
+        current_app.logger.info(f"Login data validated - Email: {data.get('email', 'N/A')}, Business Email: {data.get('business_email', 'N/A')}, Has Password: {bool(data.get('password'))}")
         
         # Check if this is a business email or regular email login
         if data.get('business_email'):
             data['email'] = data.get('business_email')
             # Flag to indicate this is a business email login
             data['business_email'] = True
+            current_app.logger.info(f"Business email login detected - Email: {data['email']}")
         
         # Login user
         response, status_code = login_user(data)
+        
+        if status_code != 200:
+            current_app.logger.warning(f"Login failed - Status: {status_code}, Response: {response}")
         
         if status_code == 200:
             # Get merchant profile if user is a merchant
@@ -480,7 +531,11 @@ def login():
         
         return jsonify(response), status_code
     except ValidationError as e:
+        current_app.logger.warning(f"Login validation error - {e.messages}")
         return jsonify({"error": "Validation error", "details": e.messages}), 400
+    except Exception as e:
+        current_app.logger.error(f"Login route error: {str(e)}", exc_info=True)
+        return jsonify({"error": "Login failed", "details": str(e) if current_app.debug else None}), 500
     
 @auth_bp.route('/refresh', methods=['POST'])
 def refresh():
@@ -605,8 +660,16 @@ def verify_email_route(token):
         description: User not found
     """
     try:
+        current_app.logger.info(f"Email verification request received for token: {token[:10]}...")
+        
+        if not token or len(token.strip()) == 0:
+            current_app.logger.warning("Empty token provided for email verification")
+            return jsonify({"error": "Invalid verification token"}), 400
+        
         # Verify email and get response
         response, status_code = verify_email(token)
+        
+        current_app.logger.info(f"Email verification result: status_code={status_code}, response={response}")
         
         if status_code != 200:
             return jsonify(response), status_code
@@ -614,19 +677,19 @@ def verify_email_route(token):
         # Get user from database
         user_id = response.get('user_id')
         if not user_id:
+            current_app.logger.error(f"User ID not found in verification response: {response}")
             return jsonify({"error": "User ID not found in verification response"}), 400
             
         user = User.get_by_id(user_id)
         if not user:
+            current_app.logger.error(f"User not found for ID: {user_id}")
             return jsonify({"error": "User not found"}), 404
             
         # Generate tokens
         access_token = create_access_token(identity=str(user.id))
         refresh_token = create_refresh_token(identity=str(user.id))
-        # after
-        access_token = create_access_token(identity=str(user.id))
-
-        refresh_token = create_refresh_token(identity=str(user.id))
+        
+        current_app.logger.info(f"Email verified successfully for user: {user.email} (ID: {user.id})")
         
         return jsonify({
             "message": "Email verified successfully",
@@ -641,7 +704,8 @@ def verify_email_route(token):
             }
         }), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        current_app.logger.error(f"Error in verify_email_route: {str(e)}", exc_info=True)
+        return jsonify({"error": "Email verification failed", "details": str(e) if current_app.debug else "Internal server error"}), 500
 
 @auth_bp.route('/google', methods=['POST'])
 def google_auth_route():
@@ -870,3 +934,388 @@ def resend_verification_email_route():
 
     except ValidationError as err:
         return jsonify({"error": "Validation error", "details": err.messages}), 400
+
+
+class MerchantVerifyEmailOtpSchema(Schema):
+    email = fields.Email(required=True)
+    otp = fields.Str(required=True, validate=validate.Length(equal=6))
+
+
+class MerchantResendEmailOtpSchema(Schema):
+    email = fields.Email(required=True)
+
+
+@auth_bp.route('/merchant/verify-email-otp', methods=['POST'])
+def verify_merchant_email_otp_route():
+    """
+    Verify a merchant's email using the OTP sent for app-based onboarding.
+    ---
+    tags:
+      - Merchant
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - email
+            - otp
+          properties:
+            email:
+              type: string
+              format: email
+            otp:
+              type: string
+              minLength: 6
+              maxLength: 6
+    responses:
+      200:
+        description: Email verified successfully (returns tokens, user and merchant)
+      400:
+        description: Validation error or invalid/expired OTP
+      403:
+        description: Not a merchant account
+      500:
+        description: Internal server error
+    """
+    try:
+        schema = MerchantVerifyEmailOtpSchema()
+        data = schema.load(request.json)
+        response, status_code = verify_merchant_email_otp(data['email'], data['otp'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+@auth_bp.route('/merchant/resend-email-otp', methods=['POST'])
+def resend_merchant_email_otp_route():
+    """
+    Resend the email-verification OTP to a merchant (app-based onboarding).
+    ---
+    tags:
+      - Merchant
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - email
+          properties:
+            email:
+              type: string
+              format: email
+    responses:
+      200:
+        description: If the email is registered and unverified, a new code was sent
+      400:
+        description: Validation error
+      429:
+        description: Rate limit exceeded
+      500:
+        description: Internal server error
+    """
+    try:
+        schema = MerchantResendEmailOtpSchema()
+        data = schema.load(request.json)
+        response, status_code = resend_merchant_email_otp(data['email'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+class UserVerifyEmailOtpSchema(Schema):
+    email = fields.Email(required=True)
+    otp = fields.Str(required=True, validate=validate.Length(equal=6))
+
+
+class UserResendEmailOtpSchema(Schema):
+    email = fields.Email(required=True)
+
+
+@auth_bp.route('/verify-email-otp', methods=['POST'])
+def verify_user_email_otp_route():
+    """
+    Verify a customer's email using the OTP sent for app-based registration.
+    ---
+    tags:
+      - Authentication
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - email
+            - otp
+          properties:
+            email:
+              type: string
+              format: email
+            otp:
+              type: string
+              minLength: 6
+              maxLength: 6
+    responses:
+      200:
+        description: Email verified successfully (returns tokens and user)
+      400:
+        description: Validation error or invalid/expired OTP
+      403:
+        description: Not a customer account
+      500:
+        description: Internal server error
+    """
+    try:
+        schema = UserVerifyEmailOtpSchema()
+        data = schema.load(request.json)
+        response, status_code = verify_user_email_otp(data['email'], data['otp'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+@auth_bp.route('/resend-email-otp', methods=['POST'])
+def resend_user_email_otp_route():
+    """
+    Resend the email-verification OTP to a customer (app-based registration).
+    ---
+    tags:
+      - Authentication
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - email
+          properties:
+            email:
+              type: string
+              format: email
+    responses:
+      200:
+        description: If the email is registered and unverified, a new code was sent
+      400:
+        description: Validation error
+      429:
+        description: Rate limit exceeded
+      500:
+        description: Internal server error
+    """
+    try:
+        schema = UserResendEmailOtpSchema()
+        data = schema.load(request.json)
+        response, status_code = resend_user_email_otp(data['email'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+@auth_bp.route('/phone/send-otp', methods=['POST'])
+def send_phone_otp_route():
+    """
+    Send OTP to phone number for sign-up or login.
+    ---
+    tags:
+      - Authentication
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - phone
+          properties:
+            phone:
+              type: string
+              description: Phone number in E.164 format (e.g., +1234567890)
+    responses:
+      200:
+        description: OTP sent successfully
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+            expires_in:
+              type: integer
+      400:
+        description: Validation error or invalid phone format
+      500:
+        description: Internal server error
+    """
+    try:
+        schema = SendPhoneOTPSchema()
+        data = schema.load(request.json)
+        
+        response, status_code = send_phone_otp(data['phone'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+@auth_bp.route('/phone/verify-signup', methods=['POST'])
+def verify_phone_signup_route():
+    """
+    Verify OTP and create new user account.
+    ---
+    tags:
+      - Authentication
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - phone
+            - otp
+            - first_name
+            - last_name
+          properties:
+            phone:
+              type: string
+            otp:
+              type: string
+              minLength: 6
+              maxLength: 6
+            first_name:
+              type: string
+            last_name:
+              type: string
+    responses:
+      201:
+        description: Account created successfully
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+            access_token:
+              type: string
+            refresh_token:
+              type: string
+            user:
+              type: object
+      400:
+        description: Validation error or invalid OTP
+      409:
+        description: Phone number already registered
+      500:
+        description: Internal server error
+    """
+    try:
+        schema = VerifyPhoneSignupSchema()
+        data = schema.load(request.json)
+        
+        response, status_code = verify_phone_otp_signup(
+            data['phone'],
+            data['otp'],
+            data['first_name'],
+            data['last_name']
+        )
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+@auth_bp.route('/phone/verify-login', methods=['POST'])
+def verify_phone_login_route():
+    """
+    Verify OTP and login existing user.
+    ---
+    tags:
+      - Authentication
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - phone
+            - otp
+          properties:
+            phone:
+              type: string
+            otp:
+              type: string
+              minLength: 6
+              maxLength: 6
+    responses:
+      200:
+        description: Login successful
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+            access_token:
+              type: string
+            refresh_token:
+              type: string
+            user:
+              type: object
+      400:
+        description: Validation error or invalid OTP
+      404:
+        description: Phone number not registered
+      500:
+        description: Internal server error
+    """
+    try:
+        schema = VerifyPhoneLoginSchema()
+        data = schema.load(request.json)
+        
+        response, status_code = verify_phone_otp_login(data['phone'], data['otp'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+# --- Creator signup: name + email + phone → OTP → verify (with resend OTP) ---
+
+@auth_bp.route('/creator/signup-request', methods=['POST'])
+def creator_signup_request_route():
+    """
+    Creator signup step 1: Submit name, email, phone. Sends OTP to phone.
+    """
+    try:
+        schema = CreatorSignupRequestSchema()
+        data = schema.load(request.json)
+        response, status_code = creator_signup_request(
+            data['first_name'],
+            data['last_name'],
+            data['email'],
+            data['phone']
+        )
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+@auth_bp.route('/creator/resend-otp', methods=['POST'])
+def creator_resend_otp_route():
+    """
+    Resend OTP for creator signup. Rate limited (e.g. once per 60 seconds).
+    """
+    try:
+        schema = CreatorResendOtpSchema()
+        data = schema.load(request.json)
+        response, status_code = creator_resend_otp(data['phone'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400
+
+
+@auth_bp.route('/creator/verify-otp', methods=['POST'])
+def creator_verify_otp_route():
+    """
+    Creator signup step 2: Verify OTP and create creator account. Returns tokens and user.
+    """
+    try:
+        schema = CreatorVerifyOtpSchema()
+        data = schema.load(request.json)
+        response, status_code = creator_verify_otp(data['phone'], data['otp'])
+        return jsonify(response), status_code
+    except ValidationError as e:
+        return jsonify({"error": "Validation error", "details": e.messages}), 400

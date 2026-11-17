@@ -1,0 +1,49 @@
+from common.database import db
+from datetime import datetime
+
+
+class ExploreBannerItem(db.Model):
+    """
+    An item (image, title, CTA) within a banner group on the "Explore" screen.
+
+    The Explore screen can have multiple banner carousels (e.g. 'hero',
+    'category', 'spotlight'). Each group can have 1-3 items. The carousel
+    order within a group is controlled by `display_order`. Managed from the
+    Superadmin panel (Catalog > Explore Screen).
+    """
+    __tablename__ = 'explore_banners'
+
+    # Define the available banner groups.
+    BANNER_GROUPS = ('hero', 'category', 'spotlight')
+
+    # Maximum number of items (images) allowed in each banner group.
+    MAX_ITEMS_PER_GROUP = 3
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_key = db.Column(db.String(100), nullable=False, index=True)  # 'hero', 'category', 'spotlight'
+    image_url = db.Column(db.String(500), nullable=False)
+    title = db.Column(db.String(255), nullable=False)
+    cta_text = db.Column(db.String(100), nullable=False)   # CTA button label, e.g. "Shop Now"
+    cta_path = db.Column(db.String(500), nullable=False)   # In-app navigation path, e.g. "/collections/summer"
+    display_order = db.Column(db.Integer, nullable=False, default=0)  # carousel position (0-based) within a group
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    deleted_at = db.Column(db.DateTime, nullable=True)  # soft delete
+
+    def __repr__(self):
+        return f'<ExploreBannerItem {self.id} [{self.group_key}]: {self.title}>'
+
+    def serialize(self):
+        return {
+            'id': self.id,
+            'group_key': self.group_key,
+            'image_url': self.image_url,
+            'title': self.title,
+            'cta_text': self.cta_text,
+            'cta_path': self.cta_path,
+            'display_order': self.display_order,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
