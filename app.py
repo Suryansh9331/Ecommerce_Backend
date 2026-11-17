@@ -184,13 +184,19 @@ def create_app(config_name='default'):
     migrate = Migrate(app, db)
 
     # Self-healing migrations for additive Meesho-style product columns.
-    # Safe to run every boot: inspects schema and only ALTERs when a column is missing.
-    with app.app_context():
-        try:
-            from init_db import migrate_meesho_product_fields
-            migrate_meesho_product_fields()
-        except Exception as e:
-            print(f"[boot] Skipped Meesho product field migration: {e}")
+    #
+    # Opt-in via RUN_BOOT_MIGRATIONS=true so this only runs in local dev
+    # where it's convenient. In production the DBA should run the migration
+    # ONCE before deploy (python init_db.py, or the SQL in
+    # migrations/sql/003_add_meesho_product_fields.sql) — not per-worker at
+    # boot, which would race across gunicorn/uwsgi workers.
+    if os.getenv('RUN_BOOT_MIGRATIONS', 'false').lower() in ('1', 'true', 'yes'):
+        with app.app_context():
+            try:
+                from init_db import migrate_meesho_product_fields
+                migrate_meesho_product_fields()
+            except Exception as e:
+                print(f"[boot] Skipped Meesho product field migration: {e}")
 
     # Register blueprints
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
