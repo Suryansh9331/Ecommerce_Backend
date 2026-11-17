@@ -36,7 +36,15 @@ class User(BaseModel):
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     is_email_verified = db.Column(db.Boolean, default=False, nullable=False)
     is_phone_verified = db.Column(db.Boolean, default=False, nullable=False)
-    auth_provider = db.Column(db.Enum(AuthProvider), default=AuthProvider.LOCAL, nullable=False)
+    # values_callable keeps SQLAlchemy using the enum's .value (lowercase 'local',
+    # 'google') to match the existing MySQL column `enum('local','google','phone')`.
+    # Without this, SQLAlchemy 2.1+ would serialize by enum NAME ('LOCAL', 'GOOGLE')
+    # and MySQL would reject the insert.
+    auth_provider = db.Column(
+        db.Enum(AuthProvider, values_callable=lambda e: [m.value for m in e]),
+        default=AuthProvider.LOCAL,
+        nullable=False,
+    )
     provider_user_id = db.Column(db.String(255), nullable=True)  # For OAuth provider user ID
     last_login = db.Column(db.DateTime, nullable=True)
     
