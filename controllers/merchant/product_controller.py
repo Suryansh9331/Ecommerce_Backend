@@ -288,3 +288,219 @@ class MerchantProductController:
         except Exception as e:
             db.session.rollback()
             abort(500, f"Failed to create variant: {str(e)}")
+
+    @staticmethod
+    def create_meesho_wizard(data):
+        """
+        Atomic Meesho-style create: parent product + stock + media + attributes
+        + meta + shipping + optional variants, all in one request.
+
+        This is purely additive — it does not change the existing /products
+        endpoint. Any of the nested sections (media, attributes, meta, shipping,
+        variants) can be omitted; omitted sections are simply skipped.
+        """
+        from models.product_stock import ProductStock
+        from models.product_media import ProductMedia
+        from models.product_attribute import ProductAttribute
+        from models.product_meta import ProductMeta
+        from models.product_shipping import ProductShipping
+        from models.attribute import Attribute
+        from models.enums import MediaType
+        import uuid
+
+        user_id = get_jwt_identity()
+        merchant = MerchantProfile.get_by_user_id(user_id)
+        if not merchant:
+            abort(404, "Merchant profile not found")
+
+        required = ['product_name', 'category_id', 'brand_id', 'selling_price']
+        missing = [f for f in required if data.get(f) in (None, '')]
+        if missing:
+            abort(400, f"Missing required fields: {', '.join(missing)}")
+
+        # MRP validation per Meesho rule: MRP >= listed price
+        if data.get('mrp') is not None and Decimal(str(data['mrp'])) < Decimal(str(data['selling_price'])):
+            abort(400, "MRP must be greater than or equal to selling price")
+
+        sku = (data.get('sku') or '').strip()
+        if not sku:
+            sku = f"SKU-{uuid.uuid4().hex[:10].upper()}"
+        if Product.query.filter_by(sku=sku).first():
+            abort(400, f"SKU '{sku}' already exists")
+
+        def _to_decimal(v):
+            return Decimal(str(v)) if v not in (None, '') else None
+
+        def _to_int(v):
+            try:
+                return int(v) if v not in (None, '') else None
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            db.session.begin_nested()
+
+            product = Product(
+                merchant_id=merchant.id,
+                category_id=data['category_id'],
+                brand_id=data['brand_id'],
+                sku=sku,
+                product_name=data['product_name'],
+                product_description=data.get('product_description') or data.get('description') or '',
+                cost_price=_to_decimal(data.get('cost_price')) or Decimal('0.00'),
+                selling_price=_to_decimal(data['selling_price']),
+                discount_pct=_to_decimal(data.get('discount_pct')) or Decimal('0.00'),
+                mrp=_to_decimal(data.get('mrp')),
+                wdrp=_to_decimal(data.get('wdrp')),
+                hsn_code=data.get('hsn_code'),
+                gst_rate=_to_decimal(data.get('gst_rate')),
+                country_of_origin=data.get('country_of_origin'),
+                manufacturer_details=data.get('manufacturer_details'),
+                packer_details=data.get('packer_details'),
+                importer_details=data.get('importer_details'),
+                style_code=data.get('style_code'),
+                weight_g=_to_int(data.get('weight_g')),
+                size_chart_url=data.get('size_chart_url'),
+                approval_status='pending',
+            )
+            db.session.add(product)
+            db.session.flush()
+
+            # Stock
+            stock = ProductStock(
+                product_id=product.product_id,
+                stock_qty=_to_int(data.get('stock_qty')) or 0,
+                low_stock_threshold=_to_int(data.get('low_stock_threshold')) or 5,
+            )
+            db.session.add(stock)
+
+            # Media
+            for idx, m in enumerate(data.get('media') or []):
+                if not m.get('url'):
+                    continue
+                media_type = MediaType.VIDEO if (m.get('type') or 'image').lower() == 'video' else MediaType.IMAGE
+                db.session.add(ProductMedia(
+                    product_id=product.product_id,
+                    type=media_type,
+                    url=m['url'],
+                    public_id=m.get('public_id'),
+                    sort_order=m.get('sort_order', idx),
+                    is_main_image=bool(m.get('is_main_image', idx == 0)),
+                    is_thumbnail=bool(m.get('is_thumbnail', idx == 0)),
+                ))
+
+            # Attributes (category-driven)
+            for attr in data.get('attributes') or []:
+                attr_id = attr.get('attribute_id')
+                if not attr_id:
+                    continue
+                attribute = Attribute.query.get(attr_id)
+                if not attribute:
+                    continue
+                pa = ProductAttribute(product_id=product.product_id, attribute_id=attr_id)
+                itype = getattr(attribute.input_type, 'value', attribute.input_type)
+                if itype in ('select', 'multiselect') and attr.get('value_code'):
+                    pa.value_code = str(attr['value_code'])
+                elif itype == 'number' and attr.get('value_number') is not None:
+                    pa.value_number = float(attr['value_number'])
+                elif attr.get('value_text') is not None:
+                    pa.value_text = str(attr['value_text'])
+                else:
+                    continue
+                db.session.add(pa)
+
+            # Meta (SEO)
+            meta = data.get('meta') or {}
+            if any(meta.get(k) for k in ('short_desc', 'full_desc', 'meta_title', 'meta_desc', 'meta_keywords')):
+                db.session.add(ProductMeta(
+                    product_id=product.product_id,
+                    short_desc=meta.get('short_desc'),
+                    full_desc=meta.get('full_desc'),
+                    meta_title=meta.get('meta_title'),
+                    meta_desc=meta.get('meta_desc'),
+                    meta_keywords=meta.get('meta_keywords'),
+                ))
+
+            # Shipping (dimensions)
+            ship = data.get('shipping') or {}
+            if any(ship.get(k) is not None for k in ('length_cm', 'width_cm', 'height_cm', 'weight_kg')):
+                db.session.add(ProductShipping(
+                    product_id=product.product_id,
+                    length_cm=_to_decimal(ship.get('length_cm')),
+                    width_cm=_to_decimal(ship.get('width_cm')),
+                    height_cm=_to_decimal(ship.get('height_cm')),
+                    weight_kg=_to_decimal(ship.get('weight_kg')),
+                ))
+
+            # Variants
+            for v in data.get('variants') or []:
+                v_sku = (v.get('sku') or '').strip() or f"SKU-{uuid.uuid4().hex[:10].upper()}"
+                if Product.query.filter_by(sku=v_sku).first():
+                    continue
+                variant = Product(
+                    merchant_id=merchant.id,
+                    category_id=product.category_id,
+                    brand_id=product.brand_id,
+                    parent_product_id=product.product_id,
+                    sku=v_sku,
+                    product_name=v.get('product_name') or product.product_name,
+                    product_description=product.product_description,
+                    cost_price=_to_decimal(v.get('cost_price')) or product.cost_price,
+                    selling_price=_to_decimal(v.get('selling_price')) or product.selling_price,
+                    discount_pct=product.discount_pct,
+                    mrp=_to_decimal(v.get('mrp')) or product.mrp,
+                    wdrp=_to_decimal(v.get('wdrp')) or product.wdrp,
+                    hsn_code=product.hsn_code,
+                    gst_rate=product.gst_rate,
+                    country_of_origin=product.country_of_origin,
+                    style_code=product.style_code,
+                    approval_status='pending',
+                )
+                db.session.add(variant)
+                db.session.flush()
+
+                db.session.add(ProductStock(
+                    product_id=variant.product_id,
+                    stock_qty=_to_int(v.get('stock_qty')) or 0,
+                    low_stock_threshold=stock.low_stock_threshold,
+                ))
+
+                for idx, m in enumerate(v.get('media') or []):
+                    if not m.get('url'):
+                        continue
+                    media_type = MediaType.VIDEO if (m.get('type') or 'image').lower() == 'video' else MediaType.IMAGE
+                    db.session.add(ProductMedia(
+                        product_id=variant.product_id,
+                        type=media_type,
+                        url=m['url'],
+                        public_id=m.get('public_id'),
+                        sort_order=m.get('sort_order', idx),
+                        is_main_image=bool(m.get('is_main_image', idx == 0)),
+                        is_thumbnail=bool(m.get('is_thumbnail', idx == 0)),
+                    ))
+
+                for attr in v.get('attributes') or []:
+                    attr_id = attr.get('attribute_id')
+                    if not attr_id:
+                        continue
+                    attribute = Attribute.query.get(attr_id)
+                    if not attribute:
+                        continue
+                    pa = ProductAttribute(product_id=variant.product_id, attribute_id=attr_id)
+                    itype = getattr(attribute.input_type, 'value', attribute.input_type)
+                    if itype in ('select', 'multiselect') and attr.get('value_code'):
+                        pa.value_code = str(attr['value_code'])
+                    elif itype == 'number' and attr.get('value_number') is not None:
+                        pa.value_number = float(attr['value_number'])
+                    elif attr.get('value_text') is not None:
+                        pa.value_text = str(attr['value_text'])
+                    else:
+                        continue
+                    db.session.add(pa)
+
+            db.session.commit()
+            return product
+
+        except Exception as e:
+            db.session.rollback()
+            raise
