@@ -4926,3 +4926,43 @@ def set_product_size_quantities(pid):
         current_app.logger.exception("Failed to save size quantities")
         return jsonify({'message': f'Failed to save size quantities: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
 
+
+# -----------------------------------------------------------------------------
+# Merchant invoice download: renders the GST tax invoice PDF for the merchant's
+# own items in a given order. Reuses the invoice helper from order_routes and
+# scopes items to the current merchant.
+# -----------------------------------------------------------------------------
+@merchant_dashboard_bp.route('/orders/<string:order_id>/invoice.pdf', methods=['GET'])
+@merchant_role_required
+def merchant_download_invoice(order_id):
+    from flask import send_file, abort
+    from io import BytesIO
+    from models.order import Order, OrderItem
+    from routes.order_routes import _build_invoice_pdf_for_order
+
+    user_id = get_jwt_identity()
+    merchant = MerchantProfile.get_by_user_id(user_id)
+    if not merchant:
+        return jsonify({'message': 'Merchant profile not found'}), HTTPStatus.NOT_FOUND
+
+    order = Order.query.filter_by(order_id=order_id).first()
+    if not order:
+        return jsonify({'message': 'Order not found'}), HTTPStatus.NOT_FOUND
+
+    items = OrderItem.query.filter_by(order_id=order_id, merchant_id=merchant.id).all()
+    if not items:
+        return jsonify({'message': 'No line items for this merchant in this order'}), HTTPStatus.NOT_FOUND
+
+    try:
+        pdf_bytes = _build_invoice_pdf_for_order(order, items)
+    except Exception as e:
+        current_app.logger.exception("Merchant invoice render failed")
+        return jsonify({'message': f'Failed to generate invoice: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+    return send_file(
+        BytesIO(pdf_bytes),
+        mimetype='application/pdf',
+        as_attachment=False,
+        download_name=f"invoice-{order_id}.pdf",
+    )
+
