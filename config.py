@@ -26,9 +26,9 @@ class Config:
     GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_CLIENT_SECRET')
     GOOGLE_DISCOVERY_URL = 'https://accounts.google.com/.well-known/openid-configuration'
 
-    # Redis Cache
+    # Cache (Redis in prod; env-overridable for local dev where Redis may not run)
     REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-    CACHE_TYPE = 'redis'
+    CACHE_TYPE = os.getenv('CACHE_TYPE', 'flask_caching.backends.RedisCache')
     CACHE_DEFAULT_TIMEOUT = 300  # 5 minutes
 
     # Cloudinary
