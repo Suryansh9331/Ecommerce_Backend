@@ -5457,3 +5457,88 @@ def available_slots():
     return jsonify({"available_slots": slots})
 
 
+# -----------------------------------------------------------------------------
+# Meesho-style product wizard: atomic create of product + stock + media +
+# attributes + meta + shipping + variants in a single transactional request.
+# Kept alongside the existing POST /products endpoint; neither replaces nor
+# changes the legacy flow.
+# -----------------------------------------------------------------------------
+@merchant_dashboard_bp.route('/products/meesho-wizard', methods=['POST'])
+@merchant_role_required
+def create_product_meesho_wizard():
+    try:
+        data = request.get_json(silent=True) or {}
+        if not data:
+            return jsonify({'message': 'No data provided'}), HTTPStatus.BAD_REQUEST
+        product = MerchantProductController.create_meesho_wizard(data)
+        return jsonify(product.serialize()), HTTPStatus.CREATED
+    except ValueError as e:
+        return jsonify({'message': str(e)}), HTTPStatus.BAD_REQUEST
+    except Exception as e:
+        current_app.logger.exception("Meesho wizard create failed")
+        return jsonify({'message': f'Failed to create product: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+# -----------------------------------------------------------------------------
+# Size-quantities endpoint used by the existing stock step in CoreProductInfo.
+# Legacy frontend code calls POST /products/{pid}/size-quantities but the
+# endpoint was never implemented, causing 404s. Adding it here as a thin wrapper
+# over ProductAttribute writes so existing callers now succeed.
+# -----------------------------------------------------------------------------
+@merchant_dashboard_bp.route('/products/<int:pid>/size-quantities', methods=['POST'])
+@merchant_role_required
+def set_product_size_quantities(pid):
+    from models.product_stock import ProductStock
+    from models.product_attribute import ProductAttribute
+    from models.attribute import Attribute
+
+    data = request.get_json(silent=True) or {}
+    items = data.get('size_quantities') or data.get('items') or []
+    if not isinstance(items, list) or not items:
+        return jsonify({'message': 'size_quantities must be a non-empty list'}), HTTPStatus.BAD_REQUEST
+
+    user_id = get_jwt_identity()
+    merchant = MerchantProfile.get_by_user_id(user_id)
+    if not merchant:
+        return jsonify({'message': 'Merchant profile not found'}), HTTPStatus.NOT_FOUND
+
+    product = Product.query.filter_by(product_id=pid, merchant_id=merchant.id, deleted_at=None).first()
+    if not product:
+        return jsonify({'message': 'Product not found'}), HTTPStatus.NOT_FOUND
+
+    try:
+        size_attr = Attribute.query.filter(db.func.lower(Attribute.name) == 'size').first()
+        total_qty = 0
+        for item in items:
+            size = str(item.get('size') or '').strip()
+            qty = int(item.get('quantity') or 0)
+            if not size:
+                continue
+            total_qty += max(qty, 0)
+            if size_attr:
+                existing = ProductAttribute.query.filter_by(
+                    product_id=pid, attribute_id=size_attr.attribute_id, value_code=size
+                ).first()
+                if existing:
+                    existing.value_number = qty
+                else:
+                    db.session.add(ProductAttribute(
+                        product_id=pid,
+                        attribute_id=size_attr.attribute_id,
+                        value_code=size,
+                        value_number=qty,
+                    ))
+
+        stock = ProductStock.query.filter_by(product_id=pid).first()
+        if stock:
+            stock.stock_qty = total_qty
+        else:
+            db.session.add(ProductStock(product_id=pid, stock_qty=total_qty, low_stock_threshold=5))
+
+        db.session.commit()
+        return jsonify({'product_id': pid, 'total_stock': total_qty, 'items': items}), HTTPStatus.OK
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.exception("Failed to save size quantities")
+        return jsonify({'message': f'Failed to save size quantities: {str(e)}'}), HTTPStatus.INTERNAL_SERVER_ERROR
+

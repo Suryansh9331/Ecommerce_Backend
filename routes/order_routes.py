@@ -1050,4 +1050,4 @@ def track_order(order_id):
         return jsonify({
             'status': 'error',
             'message': str(e)
-        }), 500 
+        }), 500

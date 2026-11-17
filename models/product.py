@@ -48,7 +48,20 @@ class Product(BaseModel):
     special_end   = db.Column(db.Date)
     
     active_flag   = db.Column(db.Boolean, default=True, nullable=False)
-    
+
+    # Meesho-style catalog fields (all nullable to stay backwards compatible)
+    mrp                    = db.Column(db.Numeric(10, 2), nullable=True)
+    wdrp                   = db.Column(db.Numeric(10, 2), nullable=True)
+    hsn_code               = db.Column(db.String(10), nullable=True)
+    gst_rate               = db.Column(db.Numeric(4, 2), nullable=True)
+    country_of_origin      = db.Column(db.String(50), nullable=True)
+    manufacturer_details   = db.Column(db.Text, nullable=True)
+    packer_details         = db.Column(db.Text, nullable=True)
+    importer_details       = db.Column(db.Text, nullable=True)
+    style_code             = db.Column(db.String(50), nullable=True)
+    weight_g               = db.Column(db.Integer, nullable=True)
+    size_chart_url         = db.Column(db.String(500), nullable=True)
+
     approval_status = db.Column(db.String(20), default='pending', nullable=False)
     approved_at     = db.Column(db.DateTime, nullable=True)
     approved_by     = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
@@ -209,6 +222,19 @@ class Product(BaseModel):
             "is_on_special_offer": is_on_special,
 
             "active_flag": bool(self.active_flag),
+
+            "mrp": float(self.mrp) if self.mrp is not None else None,
+            "wdrp": float(self.wdrp) if self.wdrp is not None else None,
+            "hsn_code": self.hsn_code,
+            "gst_rate": float(self.gst_rate) if self.gst_rate is not None else None,
+            "country_of_origin": self.country_of_origin,
+            "manufacturer_details": self.manufacturer_details,
+            "packer_details": self.packer_details,
+            "importer_details": self.importer_details,
+            "style_code": self.style_code,
+            "weight_g": self.weight_g,
+            "size_chart_url": self.size_chart_url,
+
             "approval_status": self.approval_status,
 
             # Approval metadata

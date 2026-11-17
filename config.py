@@ -43,7 +43,9 @@ class Config:
     # Redis / Flask-Caching — see docs/backend_cache_redis.md for full picture.
     # Flask-Caching: null backend by default (create_app also forces null + strips REDIS URLs).
     # Direct Redis via common.cache.get_redis_client still exists for some features.
-    CACHE_TYPE = 'null'  # null = Flask-Caching does not use Redis for @cache in normal boot
+    # Env-overridable so local dev can still opt into SimpleCache / RedisCache if needed.
+    REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+    CACHE_TYPE = os.getenv('CACHE_TYPE', 'null')
     CACHE_DEFAULT_TIMEOUT = 300  # 5 minutes
 
     # Cloudinary

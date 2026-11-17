@@ -267,6 +267,22 @@ def create_app(config_name=None):
     email_init.init_app(app)
     migrate = Migrate(app, db)
 
+    # Self-healing migrations for additive Meesho-style product columns.
+    #
+    # Opt-in via RUN_BOOT_MIGRATIONS=true so this only runs in local dev
+    # where it's convenient. In production the DBA should run the migration
+    # ONCE before deploy (python init_db.py, or the SQL in
+    # migrations/sql/003_add_meesho_product_fields.sql) — not per-worker at
+    # boot, which would race across gunicorn/uwsgi workers.
+    if os.getenv('RUN_BOOT_MIGRATIONS', 'false').lower() in ('1', 'true', 'yes'):
+        with app.app_context():
+            try:
+                from init_db import migrate_meesho_product_fields
+                migrate_meesho_product_fields()
+            except Exception as e:
+                print(f"[boot] Skipped Meesho product field migration: {e}")
+
+
     # Check ffmpeg availability for reel thumbnail generation
     def check_ffmpeg_availability():
         """Check if ffmpeg is available for thumbnail generation."""
