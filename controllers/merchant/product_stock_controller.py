@@ -139,22 +139,27 @@ class MerchantProductStockController:
             merchant_id = merchant.id
             logger.info(f"Fetching inventory stats for merchant: {merchant.business_name} (ID: {merchant_id})")
 
-            total_products = Product.query.filter_by(merchant_id=merchant_id).count()
+            # Exclude soft-deleted products from every stat so deleting a
+            # catalog item immediately drops it from inventory totals.
+            total_products = Product.query.filter_by(merchant_id=merchant_id, deleted_at=None).count()
             total_stock = db.session.query(db.func.sum(ProductStock.stock_qty)).\
                 join(Product).\
                 filter(Product.merchant_id == merchant_id).\
+                filter(Product.deleted_at.is_(None)).\
                 scalar() or 0
-            
+
             low_stock_count = db.session.query(Product).\
                 join(ProductStock).\
                 filter(Product.merchant_id == merchant_id).\
+                filter(Product.deleted_at.is_(None)).\
                 filter(ProductStock.stock_qty <= ProductStock.low_stock_threshold).\
                 filter(ProductStock.stock_qty > 0).\
                 count()
-            
+
             out_of_stock_count = db.session.query(Product).\
                 join(ProductStock).\
                 filter(Product.merchant_id == merchant_id).\
+                filter(Product.deleted_at.is_(None)).\
                 filter(ProductStock.stock_qty == 0).\
                 count()
             
@@ -179,8 +184,10 @@ class MerchantProductStockController:
             merchant_id = merchant.id
             logger.info(f"Fetching products for merchant: {merchant.business_name} (ID: {merchant_id})")
 
-            query = Product.query.filter_by(merchant_id=merchant_id)
-            
+            # Exclude soft-deleted products so deleted catalog items stop
+            # showing up in inventory.
+            query = Product.query.filter_by(merchant_id=merchant_id, deleted_at=None)
+
             if search:
                 search_term = f"%{search}%"
                 query = query.filter(or_(
