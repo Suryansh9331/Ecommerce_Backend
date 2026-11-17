@@ -456,12 +456,12 @@ def migrate_profile_img_column():
     """Add profile_img column to users table if it doesn't exist."""
     print("\nMigrating profile_img column:")
     print("----------------------------")
-    
+
     inspector = db.inspect(db.engine)
-    
+
     if 'users' in inspector.get_table_names():
         existing_columns = [col['name'] for col in inspector.get_columns('users')]
-        
+
         if 'profile_img' not in existing_columns:
             print("Adding profile_img column to users table...")
             try:
@@ -475,6 +475,50 @@ def migrate_profile_img_column():
             print("✓ profile_img column already exists")
     else:
         print("✗ users table does not exist")
+
+
+def migrate_meesho_product_fields():
+    """Idempotently add Meesho-style catalog columns to the products table."""
+    print("\nMigrating Meesho product fields:")
+    print("-------------------------------")
+
+    inspector = db.inspect(db.engine)
+
+    if 'products' not in inspector.get_table_names():
+        print("✗ products table does not exist, skipping")
+        return
+
+    existing_columns = {col['name'] for col in inspector.get_columns('products')}
+
+    new_columns = [
+        ('mrp',                  'DECIMAL(10,2) NULL'),
+        ('wdrp',                 'DECIMAL(10,2) NULL'),
+        ('hsn_code',             'VARCHAR(10) NULL'),
+        ('gst_rate',             'DECIMAL(4,2) NULL'),
+        ('country_of_origin',    'VARCHAR(50) NULL'),
+        ('manufacturer_details', 'TEXT NULL'),
+        ('packer_details',       'TEXT NULL'),
+        ('importer_details',     'TEXT NULL'),
+        ('style_code',           'VARCHAR(50) NULL'),
+        ('weight_g',             'INT NULL'),
+        ('size_chart_url',       'VARCHAR(500) NULL'),
+    ]
+
+    missing = [(name, ddl) for name, ddl in new_columns if name not in existing_columns]
+
+    if not missing:
+        print("✓ Meesho product columns already present")
+        return
+
+    try:
+        with db.engine.connect() as conn:
+            for name, ddl in missing:
+                conn.execute(text(f"ALTER TABLE products ADD COLUMN {name} {ddl}"))
+                print(f"  + added products.{name}")
+            conn.commit()
+        print(f"✓ Added {len(missing)} Meesho product columns")
+    except Exception as e:
+        print(f"✗ Failed to add Meesho product columns: {str(e)}")
 
 def init_database():
     """Initialize the database with all tables and initial data."""
@@ -493,6 +537,7 @@ def init_database():
         
         # Run migrations
         migrate_profile_img_column()
+        migrate_meesho_product_fields()
         
         # Initialize data
         init_country_configs()

@@ -183,6 +183,15 @@ def create_app(config_name='default'):
     email_init.init_app(app)
     migrate = Migrate(app, db)
 
+    # Self-healing migrations for additive Meesho-style product columns.
+    # Safe to run every boot: inspects schema and only ALTERs when a column is missing.
+    with app.app_context():
+        try:
+            from init_db import migrate_meesho_product_fields
+            migrate_meesho_product_fields()
+        except Exception as e:
+            print(f"[boot] Skipped Meesho product field migration: {e}")
+
     # Register blueprints
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(users_bp, url_prefix='/api/users')
