@@ -3540,6 +3540,28 @@ def bulk_rts_merchant_orders():
         return jsonify({'error': 'Internal server error'}), 500
 
 
+@merchant_dashboard_bp.route('/orders/<order_id>/label', methods=['GET'])
+@merchant_role_required
+def get_order_label(order_id):
+    """Return the printable Shiprocket label URL for this order.
+
+    Query params:
+      * refresh=1 — force a new URL from Shiprocket instead of the cached one
+    """
+    try:
+        user_id = get_jwt_identity()
+        refresh = request.args.get('refresh', '').lower() in ('1', 'true', 'yes')
+        result = MerchantOrderController.get_label_url(
+            user_id=user_id, order_id=order_id, refresh=refresh
+        )
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        current_app.logger.error(f"get_order_label error on {order_id}: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
 @merchant_dashboard_bp.route('/orders/<order_id>/eway-bill', methods=['POST'])
 @merchant_role_required
 def set_order_eway_bill(order_id):

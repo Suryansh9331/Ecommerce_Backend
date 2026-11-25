@@ -492,6 +492,68 @@ class MerchantOrderController:
         }
 
     @staticmethod
+    def get_label_url(user_id: int, order_id: str, refresh: bool = False):
+        """Return the printable shipping-label URL for this merchant's shipment
+        on the given order.
+
+        Caches on `shipments.label_url` (Sprint 0 column). If missing — or
+        refresh=True — we call Shiprocket to generate it.
+        """
+        from models.shipment import Shipment
+        from flask import current_app
+
+        merchant = MerchantOrderController._resolve_merchant(user_id)
+        order = MerchantOrderController._load_order_for_merchant(order_id, merchant.id)
+
+        shipment = (
+            Shipment.query
+            .filter_by(order_id=order.order_id, merchant_id=merchant.id)
+            .order_by(Shipment.shipment_id.desc())
+            .first()
+        )
+        if not shipment:
+            raise ValueError("No shipment found for this order — mark RTS first")
+        if not shipment.shiprocket_shipment_id:
+            raise ValueError(
+                "Shipment has no Shiprocket shipment ID — the carrier call "
+                "errored; retry Mark RTS from the order"
+            )
+
+        if shipment.label_url and not refresh:
+            return {
+                "order_id": order.order_id,
+                "shipment_id": shipment.shipment_id,
+                "label_url": shipment.label_url,
+                "cached": True,
+            }
+
+        try:
+            from controllers.shiprocket_controller import ShipRocketController
+            resp = ShipRocketController().generate_label(shipment.shiprocket_shipment_id)
+        except Exception as e:
+            current_app.logger.error(
+                f"Shiprocket label generation failed for shipment "
+                f"{shipment.shipment_id}: {e}",
+                exc_info=True,
+            )
+            raise ValueError(f"Shiprocket label generation failed: {e}")
+
+        label_url = (resp or {}).get("label_url") or (
+            (resp or {}).get("data", {}) or {}
+        ).get("label_url")
+        if not label_url:
+            raise ValueError("Shiprocket did not return a label URL")
+
+        shipment.label_url = label_url
+        db.session.commit()
+        return {
+            "order_id": order.order_id,
+            "shipment_id": shipment.shipment_id,
+            "label_url": label_url,
+            "cached": False,
+        }
+
+    @staticmethod
     def set_eway_bill(user_id: int, order_id: str, eway_bill_number: str):
         """Record the manually-generated e-way bill number on the order.
 

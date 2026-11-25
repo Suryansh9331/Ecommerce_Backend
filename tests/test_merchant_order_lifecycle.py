@@ -341,6 +341,111 @@ def test_set_eway_bill_rejects_invalid_values(app, bad_value):
             )
 
 
+# -------------- label reprint --------------
+
+def _mk_shipment(order, merchant, sr_id=5555, label=None):
+    from models.shipment import Shipment
+    from models.enums import ShipmentStatusEnum
+    s = Shipment(
+        order_id=order.order_id,
+        merchant_id=merchant.id,
+        carrier_name="TestCarrier",
+        shipment_status=ShipmentStatusEnum.PENDING_PICKUP,
+        shiprocket_shipment_id=sr_id,
+        label_url=label,
+    )
+    db.session.add(s)
+    db.session.commit()
+    return s
+
+
+def test_get_label_returns_cached_when_present(app):
+    from controllers.merchant.order_controller import MerchantOrderController
+    with app.app_context():
+        owner, merchant = _mk_merchant_owner()
+        buyer = _mk_user("blabel1@ex.com")
+        addr = _mk_address(buyer)
+        order = _mk_order(buyer, merchant, addr)
+        _mk_shipment(order, merchant, label="https://sr.example/cached.pdf")
+        oid, uid = order.order_id, owner.id
+
+        result = MerchantOrderController.get_label_url(user_id=uid, order_id=oid)
+
+        assert result["cached"] is True
+        assert result["label_url"] == "https://sr.example/cached.pdf"
+
+
+def test_get_label_fetches_fresh_when_no_cache(app):
+    from controllers.merchant.order_controller import MerchantOrderController
+    with app.app_context():
+        owner, merchant = _mk_merchant_owner()
+        buyer = _mk_user("blabel2@ex.com")
+        addr = _mk_address(buyer)
+        order = _mk_order(buyer, merchant, addr)
+        _mk_shipment(order, merchant, label=None)
+        oid, uid = order.order_id, owner.id
+
+        from controllers.shiprocket_controller import ShipRocketController
+        with patch.object(
+            ShipRocketController, "generate_label",
+            lambda self, shipment_id: {"label_url": "https://sr.example/fresh.pdf"},
+        ):
+            result = MerchantOrderController.get_label_url(user_id=uid, order_id=oid)
+
+        assert result["cached"] is False
+        assert result["label_url"] == "https://sr.example/fresh.pdf"
+
+
+def test_get_label_refresh_bypasses_cache(app):
+    from controllers.merchant.order_controller import MerchantOrderController
+    with app.app_context():
+        owner, merchant = _mk_merchant_owner()
+        buyer = _mk_user("blabel3@ex.com")
+        addr = _mk_address(buyer)
+        order = _mk_order(buyer, merchant, addr)
+        _mk_shipment(order, merchant, label="https://sr.example/stale.pdf")
+        oid, uid = order.order_id, owner.id
+
+        from controllers.shiprocket_controller import ShipRocketController
+        with patch.object(
+            ShipRocketController, "generate_label",
+            lambda self, shipment_id: {"label_url": "https://sr.example/new.pdf"},
+        ):
+            result = MerchantOrderController.get_label_url(
+                user_id=uid, order_id=oid, refresh=True
+            )
+
+        assert result["cached"] is False
+        assert result["label_url"] == "https://sr.example/new.pdf"
+
+
+def test_get_label_errors_when_no_shipment(app):
+    from controllers.merchant.order_controller import MerchantOrderController
+    with app.app_context():
+        owner, merchant = _mk_merchant_owner()
+        buyer = _mk_user("blabel4@ex.com")
+        addr = _mk_address(buyer)
+        order = _mk_order(buyer, merchant, addr)
+        oid, uid = order.order_id, owner.id
+
+        with pytest.raises(ValueError, match="No shipment"):
+            MerchantOrderController.get_label_url(user_id=uid, order_id=oid)
+
+
+def test_get_label_errors_when_shipment_has_no_sr_id(app):
+    from controllers.merchant.order_controller import MerchantOrderController
+    with app.app_context():
+        owner, merchant = _mk_merchant_owner()
+        buyer = _mk_user("blabel5@ex.com")
+        addr = _mk_address(buyer)
+        order = _mk_order(buyer, merchant, addr)
+        _mk_shipment(order, merchant, sr_id=None, label=None)
+        oid, uid = order.order_id, owner.id
+
+        with pytest.raises(ValueError, match="Shiprocket"):
+            MerchantOrderController.get_label_url(user_id=uid, order_id=oid)
+
+
 # -------------- SLA breach detector --------------
 
 def test_sla_breach_flags_only_overdue_accepted_orders(app):
