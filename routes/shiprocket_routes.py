@@ -978,6 +978,62 @@ def get_shop_pickup_location(shop_id):
         return error_response(f"Failed to get shop pickup location: {str(e)}", 500)
 
 
+@shiprocket_bp.route('/shipments/<int:shipment_id>/label', methods=['GET'])
+@merchant_role_required
+def get_shipping_label(shipment_id):
+    """
+    Fetch (and cache) the printable shipping-label PDF URL for a shipment.
+
+    Returns `{label_url: "..."}`. The URL is a Shiprocket-hosted PDF that
+    expires after ~72 hours — merchants download/print it directly from the
+    browser.
+
+    If we've already fetched the label for this shipment, return the cached
+    URL immediately (unless `?refresh=true` is passed to force re-fetch).
+    """
+    from models.shipment import Shipment
+    from common.database import db
+
+    shipment = Shipment.query.filter_by(shipment_id=shipment_id).first()
+    if not shipment:
+        return error_response(f"Shipment {shipment_id} not found", 404)
+    if not shipment.shiprocket_shipment_id:
+        return error_response(
+            "Shipment has no Shiprocket shipment ID — label cannot be generated",
+            400,
+        )
+
+    refresh = (request.args.get("refresh", "").lower() in ("1", "true", "yes"))
+    if shipment.label_url and not refresh:
+        return success_response("Label URL served from cache", {
+            "shipment_id": shipment.shipment_id,
+            "label_url": shipment.label_url,
+            "cached": True,
+        })
+
+    try:
+        shiprocket = ShipRocketController()
+        response = shiprocket.generate_label(shipment.shiprocket_shipment_id)
+    except Exception as e:
+        current_app.logger.exception("Shiprocket label generation failed")
+        return error_response(f"Label generation failed: {str(e)}", 502)
+
+    label_url = response.get("label_url") or (response.get("data", {}) or {}).get("label_url")
+    if not label_url:
+        return error_response(
+            f"Shiprocket did not return a label URL: {response}", 502
+        )
+
+    shipment.label_url = label_url
+    db.session.commit()
+
+    return success_response("Label URL generated", {
+        "shipment_id": shipment.shipment_id,
+        "label_url": label_url,
+        "cached": False,
+    })
+
+
 @shiprocket_bp.route('/return-pickup', methods=['POST'])
 @merchant_role_required
 def create_return_pickup():
