@@ -591,100 +591,12 @@ def get_tracking_by_db_order_id(order_id):
     except Exception as e:
         return error_response(f"Tracking details fetch failed: {str(e)}", 500)
 
-@shiprocket_bp.route('/bulk-create-orders', methods=['POST'])
-@super_admin_role_required
-def bulk_create_shiprocket_orders():
-    """
-    Create multiple ShipRocket orders for pending shipments
-    ---
-    tags:
-      - ShipRocket
-    security:
-      - Bearer: []
-    requestBody:
-      required: true
-      content:
-        application/json:
-          schema:
-            type: object
-            properties:
-              order_ids:
-                type: array
-                items:
-                  type: string
-                description: List of order IDs to process
-              merchant_id:
-                type: integer
-                description: Merchant ID (if processing for specific merchant)
-    responses:
-      200:
-        description: Bulk order creation completed
-        schema:
-          type: object
-          properties:
-            success:
-              type: boolean
-            data:
-              type: object
-              properties:
-                successful:
-                  type: array
-                failed:
-                  type: array
-      400:
-        description: Invalid request data
-      500:
-        description: Internal server error
-    """
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return error_response("Request data is required", 400)
-        
-        order_ids = data.get('order_ids', [])
-        merchant_id = data.get('merchant_id')
-        
-        if not order_ids:
-            return error_response("At least one order ID is required", 400)
-        
-        shiprocket = ShipRocketController()
-        successful = []
-        failed = []
-        
-        for order_id in order_ids:
-            try:
-                # This would need to be implemented based on your business logic
-                # For now, we'll just track the attempt
-                response = shiprocket.create_shiprocket_order_from_db_order(
-                    order_id=order_id,
-                    merchant_id=merchant_id,
-                    pickup_address_id=None,  # Would need to be determined
-                    delivery_address_id=None,  # Would need to be determined
-                    courier_id=None
-                )
-                successful.append({
-                    'order_id': order_id,
-                    'response': response
-                })
-            except Exception as e:
-                failed.append({
-                    'order_id': order_id,
-                    'error': str(e)
-                })
-        
-        result = {
-            'successful': successful,
-            'failed': failed,
-            'total_processed': len(order_ids),
-            'successful_count': len(successful),
-            'failed_count': len(failed)
-        }
-        
-        return success_response("Bulk order creation completed", result)
-        
-    except Exception as e:
-        return error_response(f"Bulk order creation failed: {str(e)}", 500)
+# Previously: /bulk-create-orders — removed because delivery_address_id was
+# hardcoded to None, making every call fail. The real bulk-ship path is
+# /create-orders-for-all-merchants (below), which looks up the addresses from
+# the order. Phase 2 Sprint 2 will add a proper merchant-side bulk-RTS endpoint
+# that iterates over accepted orders and calls the single-order flow per order.
+
 
 @shiprocket_bp.route('/create-orders-for-all-merchants', methods=['POST'])
 @jwt_required()
