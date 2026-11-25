@@ -1050,6 +1050,51 @@ def migrate_meesho_product_fields():
         print(f"✗ Failed to add Meesho product columns: {str(e)}")
 
 
+def migrate_shipment_tracking_columns():
+    """Idempotently add Phase 2 Sprint 0 columns to the shipments table.
+
+    Covers return-shipment tracking, label URLs, manifests, and the status-sync
+    fields the 15-min scheduler + webhook handler write to. Safe to run on every
+    boot: inspects schema first and only ALTERs missing columns.
+    """
+    print("\nMigrating Shipment tracking columns:")
+    print("------------------------------------")
+
+    inspector = db.inspect(db.engine)
+
+    if 'shipments' not in inspector.get_table_names():
+        print("✗ shipments table does not exist, skipping")
+        return
+
+    existing_columns = {col['name'] for col in inspector.get_columns('shipments')}
+
+    new_columns = [
+        ('return_shipment_id',       'INT NULL'),
+        ('reverse_awb_code',         'VARCHAR(50) NULL'),
+        ('label_url',                'VARCHAR(500) NULL'),
+        ('manifest_id',              'VARCHAR(50) NULL'),
+        ('sr_status_last_synced_at', 'DATETIME NULL'),
+        ('sr_last_synced_status',    'VARCHAR(50) NULL'),
+        ('sr_error_message',         'TEXT NULL'),
+    ]
+
+    missing = [(n, ddl) for n, ddl in new_columns if n not in existing_columns]
+
+    if not missing:
+        print("✓ Shipment tracking columns already present")
+        return
+
+    try:
+        with db.engine.connect() as conn:
+            for name, ddl in missing:
+                conn.execute(text(f"ALTER TABLE shipments ADD COLUMN {name} {ddl}"))
+                print(f"  + added shipments.{name}")
+            conn.commit()
+        print(f"✓ Added {len(missing)} shipment tracking columns")
+    except Exception as e:
+        print(f"✗ Failed to add shipment tracking columns: {str(e)}")
+
+
 def migrate_order_lifecycle_columns():
     """Idempotently add Phase 2 Sprint 2 fulfillment lifecycle columns to orders."""
     print("\nMigrating Order lifecycle columns:")
@@ -1790,6 +1835,7 @@ def init_database():
         # Run migrations
         migrate_profile_img_column()
         migrate_meesho_product_fields()
+        migrate_shipment_tracking_columns()
         migrate_order_lifecycle_columns()
 
         # Verify all tables are created

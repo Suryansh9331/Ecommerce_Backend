@@ -223,19 +223,54 @@ class ShipRocketController:
     def create_order(self, order_data):
         """
         Create order in ShipRocket
-        
+
         Args:
             order_data (dict): Order data for ShipRocket
-        
+
         Returns:
             dict: ShipRocket order response with order_id and shipment_id
         """
         try:
             response = self._make_request('POST', 'orders/create/adhoc', data=order_data)
             return response
-            
+
         except Exception as e:
             current_app.logger.error(f"ShipRocket order creation failed: {str(e)}")
+            raise
+
+    def create_return_order(self, return_data):
+        """
+        Create a REVERSE (return) order in ShipRocket.
+
+        Shiprocket's reverse-pickup endpoint takes the same shape as a normal
+        order but with the pickup and delivery addresses swapped — the item
+        is picked up from the customer and delivered back to the merchant.
+
+        Returns the raw SR response. On success, response['data'] contains
+        'order_id' and 'shipment_id' for the reverse shipment.
+        """
+        try:
+            return self._make_request('POST', 'orders/create/return', data=return_data)
+        except Exception as e:
+            current_app.logger.error(f"ShipRocket return order creation failed: {str(e)}")
+            raise
+
+    def generate_label(self, shipment_id):
+        """
+        Generate a printable shipping label PDF for an existing SR shipment.
+
+        Shiprocket accepts a LIST of shipment_ids; we wrap the single-shipment
+        case for convenience. On success, response['label_url'] is a public
+        PDF URL that expires after ~72 hours — persist it on Shipment.label_url
+        and let the merchant click through.
+        """
+        try:
+            return self._make_request(
+                'POST', 'courier/generate/label',
+                data={"shipment_id": [int(shipment_id)]},
+            )
+        except Exception as e:
+            current_app.logger.error(f"ShipRocket label generation failed: {str(e)}")
             raise
     
     def assign_awb(self, shipment_id, courier_id):
@@ -482,6 +517,10 @@ class ShipRocketController:
             awb_code = None
             courier_name = selected_courier.get('courier_name', 'Unknown')
             
+            # Track which stage of the SR call chain failed so the caller can
+            # retry from that stage rather than starting over.
+            sr_stage = None
+            sr_error = None
             try:
                 # Split customer name into first and last name
                 customer_name = delivery_address.contact_name or f"{order.user.first_name} {order.user.last_name}"
@@ -566,48 +605,70 @@ class ShipRocketController:
                 if not order_items:
                     current_app.logger.warning("No order items found for ShipRocket order")
 
-                # Create order in ShipRocket
+                # Stage 1: Create order in ShipRocket
+                sr_stage = "create_order"
                 order_response = self.create_order(order_data)
-                
-                if order_response.get('status') == 200:
-                    shiprocket_order_id = order_response['data']['order_id']
-                    shipment_id = order_response['data']['shipment_id']
-                    
-                    # Assign AWB
-                    awb_response = self.assign_awb(shipment_id, selected_courier['courier_company_id'])
-                    
-                    if awb_response.get('status') == 200:
-                        awb_code = awb_response['data']['awb_code']
-                        courier_name = awb_response['data']['courier_name']
-                        
-                        # Generate pickup
-                        pickup_response = self.generate_pickup(shipment_id)
-                        
-                        if pickup_response.get('status') == 200:
-                            # Update shipment with ShipRocket details
-                            shipment.shiprocket_order_id = shiprocket_order_id
-                            shipment.shiprocket_shipment_id = shipment_id
-                            shipment.awb_code = awb_code
-                            shipment.tracking_number = awb_code
-                            shipment.carrier_name = courier_name
-                            shipment.shipment_status = ShipmentStatusEnum.LABEL_CREATED
-                            shipment.shipped_date = datetime.now(timezone.utc)
-                            shipment.pickup_generated = True
-                            shipment.pickup_generated_at = datetime.now(timezone.utc)
-                            db.session.commit()
-                            
-                            current_app.logger.info(f"ShipRocket order created successfully for merchant {merchant_id}")
-                        else:
-                            current_app.logger.warning(f"Pickup generation failed: {pickup_response.get('message', 'Unknown error')}")
-                    else:
-                        current_app.logger.warning(f"AWB assignment failed: {awb_response.get('message', 'Unknown error')}")
-                else:
-                    current_app.logger.warning(f"ShipRocket order creation failed: {order_response.get('message', 'Unknown error')}")
-                    
+                if order_response.get('status') != 200:
+                    raise Exception(f"create_order: {order_response.get('message', 'Unknown error')}")
+                shiprocket_order_id = order_response['data']['order_id']
+                shipment_id = order_response['data']['shipment_id']
+                # Persist partial progress so a retry can resume
+                shipment.shiprocket_order_id = shiprocket_order_id
+                shipment.shiprocket_shipment_id = shipment_id
+
+                # Stage 2: Assign AWB
+                sr_stage = "assign_awb"
+                awb_response = self.assign_awb(shipment_id, selected_courier['courier_company_id'])
+                if awb_response.get('status') != 200:
+                    raise Exception(f"assign_awb: {awb_response.get('message', 'Unknown error')}")
+                awb_code = awb_response['data']['awb_code']
+                courier_name = awb_response['data']['courier_name']
+                shipment.awb_code = awb_code
+                shipment.tracking_number = awb_code
+                shipment.carrier_name = courier_name
+
+                # Stage 3: Generate pickup
+                sr_stage = "generate_pickup"
+                pickup_response = self.generate_pickup(shipment_id)
+                if pickup_response.get('status') != 200:
+                    raise Exception(f"generate_pickup: {pickup_response.get('message', 'Unknown error')}")
+
+                # All three stages succeeded — flip shipment to LABEL_CREATED
+                shipment.shipment_status = ShipmentStatusEnum.LABEL_CREATED
+                shipment.shipped_date = datetime.now(timezone.utc)
+                shipment.pickup_generated = True
+                shipment.pickup_generated_at = datetime.now(timezone.utc)
+                shipment.sr_error_message = None  # clear any stale error from prior retry
+                db.session.commit()
+
+                current_app.logger.info(
+                    f"ShipRocket order created successfully for merchant {merchant_id}"
+                )
+
             except Exception as shiprocket_error:
-                current_app.logger.warning(f"ShipRocket order creation failed for merchant {merchant_id}: {str(shiprocket_error)}")
-                # Don't fail the entire process if ShipRocket fails
-            
+                sr_error = str(shiprocket_error)
+                current_app.logger.warning(
+                    f"ShipRocket stage={sr_stage} failed for merchant {merchant_id}: {sr_error}"
+                )
+                # Mark shipment as EXCEPTION so the UI shows the real state and
+                # the status-sync scheduler knows to retry from `sr_stage`.
+                shipment.shipment_status = ShipmentStatusEnum.EXCEPTION
+                shipment.sr_error_message = f"{sr_stage}: {sr_error}"[:65535]
+                db.session.commit()
+                return {
+                    "success": False,
+                    "stage": sr_stage,
+                    "error": sr_error,
+                    "shiprocket_order_id": shiprocket_order_id,
+                    "shipment_id": shipment_id,
+                    "awb_code": awb_code,
+                    "courier_name": courier_name,
+                    "tracking_number": awb_code,
+                    "serviceability": serviceability_response,
+                    "db_shipment": shipment.serialize(),
+                    "courier_data": cleaned_courier,
+                }
+
             return {
                 "success": True,
                 "shiprocket_order_id": shiprocket_order_id,

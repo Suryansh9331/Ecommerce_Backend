@@ -1,10 +1,11 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from controllers.shiprocket_controller import ShipRocketController
-from auth.utils import super_admin_role_required , merchant_role_required 
+from auth.utils import super_admin_role_required , merchant_role_required
 from common.response import success_response, error_response
+from services.shiprocket_webhook import process_shiprocket_webhook, WebhookError
+import os
 import traceback
 from flask_jwt_extended import jwt_required
-from flask import current_app
 
 shiprocket_bp = Blueprint('shiprocket', __name__, url_prefix='/api/shiprocket')
 
@@ -591,100 +592,12 @@ def get_tracking_by_db_order_id(order_id):
     except Exception as e:
         return error_response(f"Tracking details fetch failed: {str(e)}", 500)
 
-@shiprocket_bp.route('/bulk-create-orders', methods=['POST'])
-@super_admin_role_required
-def bulk_create_shiprocket_orders():
-    """
-    Create multiple ShipRocket orders for pending shipments
-    ---
-    tags:
-      - ShipRocket
-    security:
-      - Bearer: []
-    requestBody:
-      required: true
-      content:
-        application/json:
-          schema:
-            type: object
-            properties:
-              order_ids:
-                type: array
-                items:
-                  type: string
-                description: List of order IDs to process
-              merchant_id:
-                type: integer
-                description: Merchant ID (if processing for specific merchant)
-    responses:
-      200:
-        description: Bulk order creation completed
-        schema:
-          type: object
-          properties:
-            success:
-              type: boolean
-            data:
-              type: object
-              properties:
-                successful:
-                  type: array
-                failed:
-                  type: array
-      400:
-        description: Invalid request data
-      500:
-        description: Internal server error
-    """
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return error_response("Request data is required", 400)
-        
-        order_ids = data.get('order_ids', [])
-        merchant_id = data.get('merchant_id')
-        
-        if not order_ids:
-            return error_response("At least one order ID is required", 400)
-        
-        shiprocket = ShipRocketController()
-        successful = []
-        failed = []
-        
-        for order_id in order_ids:
-            try:
-                # This would need to be implemented based on your business logic
-                # For now, we'll just track the attempt
-                response = shiprocket.create_shiprocket_order_from_db_order(
-                    order_id=order_id,
-                    merchant_id=merchant_id,
-                    pickup_address_id=None,  # Would need to be determined
-                    delivery_address_id=None,  # Would need to be determined
-                    courier_id=None
-                )
-                successful.append({
-                    'order_id': order_id,
-                    'response': response
-                })
-            except Exception as e:
-                failed.append({
-                    'order_id': order_id,
-                    'error': str(e)
-                })
-        
-        result = {
-            'successful': successful,
-            'failed': failed,
-            'total_processed': len(order_ids),
-            'successful_count': len(successful),
-            'failed_count': len(failed)
-        }
-        
-        return success_response("Bulk order creation completed", result)
-        
-    except Exception as e:
-        return error_response(f"Bulk order creation failed: {str(e)}", 500)
+# Previously: /bulk-create-orders — removed because delivery_address_id was
+# hardcoded to None, making every call fail. The real bulk-ship path is
+# /create-orders-for-all-merchants (below), which looks up the addresses from
+# the order. Phase 2 Sprint 2 will add a proper merchant-side bulk-RTS endpoint
+# that iterates over accepted orders and calls the single-order flow per order.
+
 
 @shiprocket_bp.route('/create-orders-for-all-merchants', methods=['POST'])
 @jwt_required()
@@ -1060,6 +973,211 @@ def get_shop_pickup_location(shop_id):
             "pickup_location_name": pickup_location_name,
             "shop_id": shop_id
         })
-        
+
     except Exception as e:
-        return error_response(f"Failed to get shop pickup location: {str(e)}", 500) 
+        return error_response(f"Failed to get shop pickup location: {str(e)}", 500)
+
+
+@shiprocket_bp.route('/shipments/<int:shipment_id>/label', methods=['GET'])
+@merchant_role_required
+def get_shipping_label(shipment_id):
+    """
+    Fetch (and cache) the printable shipping-label PDF URL for a shipment.
+
+    Returns `{label_url: "..."}`. The URL is a Shiprocket-hosted PDF that
+    expires after ~72 hours — merchants download/print it directly from the
+    browser.
+
+    If we've already fetched the label for this shipment, return the cached
+    URL immediately (unless `?refresh=true` is passed to force re-fetch).
+    """
+    from models.shipment import Shipment
+    from common.database import db
+
+    shipment = Shipment.query.filter_by(shipment_id=shipment_id).first()
+    if not shipment:
+        return error_response(f"Shipment {shipment_id} not found", 404)
+    if not shipment.shiprocket_shipment_id:
+        return error_response(
+            "Shipment has no Shiprocket shipment ID — label cannot be generated",
+            400,
+        )
+
+    refresh = (request.args.get("refresh", "").lower() in ("1", "true", "yes"))
+    if shipment.label_url and not refresh:
+        return success_response("Label URL served from cache", {
+            "shipment_id": shipment.shipment_id,
+            "label_url": shipment.label_url,
+            "cached": True,
+        })
+
+    try:
+        shiprocket = ShipRocketController()
+        response = shiprocket.generate_label(shipment.shiprocket_shipment_id)
+    except Exception as e:
+        current_app.logger.exception("Shiprocket label generation failed")
+        return error_response(f"Label generation failed: {str(e)}", 502)
+
+    label_url = response.get("label_url") or (response.get("data", {}) or {}).get("label_url")
+    if not label_url:
+        return error_response(
+            f"Shiprocket did not return a label URL: {response}", 502
+        )
+
+    shipment.label_url = label_url
+    db.session.commit()
+
+    return success_response("Label URL generated", {
+        "shipment_id": shipment.shipment_id,
+        "label_url": label_url,
+        "cached": False,
+    })
+
+
+@shiprocket_bp.route('/return-pickup', methods=['POST'])
+@merchant_role_required
+def create_return_pickup():
+    """
+    Schedule a reverse (return) pickup for an existing shipment.
+
+    Body: {"shipment_id": <int>}
+
+    Looks up the original forward shipment, builds the SR return payload using
+    the stored customer delivery address (now source) and merchant pickup
+    address (now destination), calls SR's reverse pickup API, then stores the
+    reverse AWB + return_shipment_id back on the Shipment row.
+
+    Phase 3 wiring (not here): the return approval flow will call this
+    automatically when a merchant approves a return request.
+    """
+    from models.shipment import Shipment
+    from common.database import db
+
+    data = request.get_json(silent=True) or {}
+    shipment_id = data.get("shipment_id")
+    if not shipment_id:
+        return error_response("shipment_id is required", 400)
+
+    shipment = Shipment.query.filter_by(shipment_id=shipment_id).first()
+    if not shipment:
+        return error_response(f"Shipment {shipment_id} not found", 404)
+    if not shipment.shiprocket_order_id:
+        return error_response(
+            "Shipment has no Shiprocket order ID — cannot reverse-pickup", 400
+        )
+    if shipment.reverse_awb_code:
+        return success_response(
+            "Return pickup already exists for this shipment",
+            {
+                "shipment_id": shipment.shipment_id,
+                "reverse_awb_code": shipment.reverse_awb_code,
+                "return_shipment_id": shipment.return_shipment_id,
+            },
+        )
+
+    pickup = shipment.delivery_address   # customer address — picked up FROM
+    drop = shipment.pickup_address       # merchant address — delivered TO
+    if not pickup or not drop:
+        return error_response(
+            "Both pickup and delivery addresses must exist on the original shipment",
+            400,
+        )
+
+    return_payload = {
+        "order_id": f"RTN-{shipment.order_id}-{shipment.shipment_id}",
+        "order_date": shipment.shipped_date.strftime("%Y-%m-%d %H:%M") if shipment.shipped_date else "",
+        "channel_id": "",
+        "pickup_customer_name": pickup.contact_name or "",
+        "pickup_last_name": "",
+        "pickup_address": pickup.address_line1 or "",
+        "pickup_address_2": getattr(pickup, "address_line2", "") or "",
+        "pickup_city": pickup.city,
+        "pickup_state": pickup.state_province,
+        "pickup_country": pickup.country_code or "India",
+        "pickup_pincode": pickup.postal_code,
+        "pickup_email": "",
+        "pickup_phone": pickup.contact_phone or "",
+        "shipping_customer_name": drop.contact_name or "",
+        "shipping_last_name": "",
+        "shipping_address": drop.address_line1 or "",
+        "shipping_address_2": getattr(drop, "address_line2", "") or "",
+        "shipping_city": drop.city,
+        "shipping_state": drop.state_province,
+        "shipping_country": drop.country_code or "India",
+        "shipping_pincode": drop.postal_code,
+        "shipping_email": "",
+        "shipping_phone": drop.contact_phone or "",
+        "order_items": [{
+            "name": f"Return for order {shipment.order_id}",
+            "sku": f"RTN-{shipment.order_id}",
+            "units": 1,
+            "selling_price": "1",
+        }],
+        "payment_method": "Prepaid",
+        "sub_total": 1,
+        "length": 10, "breadth": 10, "height": 10, "weight": 0.5,
+    }
+
+    try:
+        shiprocket = ShipRocketController()
+        response = shiprocket.create_return_order(return_payload)
+    except Exception as e:
+        current_app.logger.exception("Return pickup SR call failed")
+        return error_response(f"Reverse pickup creation failed: {str(e)}", 502)
+
+    if response.get("status") != 200:
+        return error_response(
+            f"Shiprocket rejected reverse pickup: {response.get('message', 'Unknown error')}",
+            502,
+        )
+
+    sr_data = response.get("data", {}) or {}
+    shipment.return_shipment_id = sr_data.get("shipment_id")
+    shipment.reverse_awb_code = (
+        sr_data.get("awb_code")
+        or (sr_data.get("response", {}) or {}).get("awb_code")
+    )
+    db.session.commit()
+
+    return success_response("Return pickup scheduled successfully", {
+        "shipment_id": shipment.shipment_id,
+        "return_shipment_id": shipment.return_shipment_id,
+        "reverse_awb_code": shipment.reverse_awb_code,
+        "shiprocket_response": response,
+    })
+
+
+@shiprocket_bp.route('/webhook', methods=['POST'])
+def shiprocket_webhook():
+    """
+    Receive shipment status updates pushed by Shiprocket.
+
+    Shiprocket calls this endpoint whenever a shipment progresses (shipped →
+    in-transit → out-for-delivery → delivered, or exception/RTO). We verify
+    the shared-secret token (header `X-Api-Key`) matches
+    `SHIPROCKET_WEBHOOK_TOKEN` configured on the server, then update the
+    local Shipment + Order rows.
+
+    Public endpoint — not JWT-protected — since Shiprocket cannot send our
+    user tokens. Security = token in header.
+    """
+    expected_token = os.getenv("SHIPROCKET_WEBHOOK_TOKEN")
+    received_token = request.headers.get("X-Api-Key") or request.headers.get("x-api-key")
+
+    payload = request.get_json(silent=True)
+
+    try:
+        result = process_shiprocket_webhook(
+            payload=payload or {},
+            received_token=received_token,
+            expected_token=expected_token,
+        )
+    except WebhookError as e:
+        current_app.logger.warning(f"Shiprocket webhook rejected: {e}")
+        return jsonify({"status": "error", "message": str(e)}), e.http_status
+    except Exception as e:
+        current_app.logger.exception("Shiprocket webhook handler crashed")
+        return jsonify({"status": "error", "message": "Internal error"}), 500
+
+    # Return 200 quickly so Shiprocket doesn't retry
+    return jsonify({"status": "ok", "changes": result}), 200 

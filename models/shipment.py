@@ -25,7 +25,20 @@ class Shipment(BaseModel):
     courier_id = db.Column(db.Integer, nullable=True)
     pickup_generated = db.Column(db.Boolean, default=False, nullable=False)
     pickup_generated_at = db.Column(db.DateTime, nullable=True)
-    
+
+    # Return (reverse) shipment tracking — set when a return is initiated
+    return_shipment_id = db.Column(db.Integer, nullable=True, index=True)
+    reverse_awb_code = db.Column(db.String(50), nullable=True, index=True)
+
+    # Printable label + manifest from ShipRocket
+    label_url = db.Column(db.String(500), nullable=True)
+    manifest_id = db.Column(db.String(50), nullable=True)
+
+    # Status sync + debugging aids for the polling scheduler and webhook handler
+    sr_status_last_synced_at = db.Column(db.DateTime, nullable=True)
+    sr_last_synced_status = db.Column(db.String(50), nullable=True)
+    sr_error_message = db.Column(db.Text, nullable=True)
+
     # Pickup and delivery addresses
     pickup_address_id = db.Column(db.Integer, db.ForeignKey('user_addresses.address_id', ondelete='SET NULL'), nullable=True)
     delivery_address_id = db.Column(db.Integer, db.ForeignKey('user_addresses.address_id', ondelete='SET NULL'), nullable=True)
@@ -62,6 +75,13 @@ class Shipment(BaseModel):
             "courier_id": self.courier_id,
             "pickup_generated": self.pickup_generated,
             "pickup_generated_at": self.pickup_generated_at.isoformat() if self.pickup_generated_at else None,
+            "return_shipment_id": self.return_shipment_id,
+            "reverse_awb_code": self.reverse_awb_code,
+            "label_url": self.label_url,
+            "manifest_id": self.manifest_id,
+            "sr_status_last_synced_at": self.sr_status_last_synced_at.isoformat() if self.sr_status_last_synced_at else None,
+            "sr_last_synced_status": self.sr_last_synced_status,
+            "sr_error_message": self.sr_error_message,
             "pickup_address_id": self.pickup_address_id,
             "delivery_address_id": self.delivery_address_id,
             "pickup_address": self.pickup_address.serialize() if self.pickup_address else None,
