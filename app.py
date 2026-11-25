@@ -1164,6 +1164,39 @@ def create_app(config_name=None):
             f"Failed to start shipment status sync scheduler: {str(e)}"
         )
 
+    # Order fulfillment SLA breach scan — flips sla_breached on orders that
+    # have been accepted but not RTS'd within 48h. Runs once per hour; the
+    # check itself is cheap (indexed scan + boolean flip).
+    def start_sla_breach_scheduler():
+        sched = BackgroundScheduler()
+
+        def sla_job():
+            with app.app_context():
+                from services.sla_breach_service import detect_sla_breaches
+
+                try:
+                    detect_sla_breaches(logger=app.logger)
+                except Exception as e:
+                    app.logger.error(
+                        "SLA breach scan failed: %s", e, exc_info=True
+                    )
+
+        sched.add_job(
+            sla_job,
+            "interval",
+            hours=1,
+            id="order_sla_breach_scan",
+            replace_existing=True,
+            max_instances=1,
+        )
+        sched.start()
+        app.logger.info("Order SLA breach scheduler started (every 1 hour)")
+
+    try:
+        start_sla_breach_scheduler()
+    except Exception as e:
+        app.logger.error(f"Failed to start SLA breach scheduler: {str(e)}")
+
     return app
 
 if __name__ == "__main__":
