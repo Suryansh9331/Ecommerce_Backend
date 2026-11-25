@@ -978,6 +978,119 @@ def get_shop_pickup_location(shop_id):
         return error_response(f"Failed to get shop pickup location: {str(e)}", 500)
 
 
+@shiprocket_bp.route('/return-pickup', methods=['POST'])
+@merchant_role_required
+def create_return_pickup():
+    """
+    Schedule a reverse (return) pickup for an existing shipment.
+
+    Body: {"shipment_id": <int>}
+
+    Looks up the original forward shipment, builds the SR return payload using
+    the stored customer delivery address (now source) and merchant pickup
+    address (now destination), calls SR's reverse pickup API, then stores the
+    reverse AWB + return_shipment_id back on the Shipment row.
+
+    Phase 3 wiring (not here): the return approval flow will call this
+    automatically when a merchant approves a return request.
+    """
+    from models.shipment import Shipment
+    from common.database import db
+
+    data = request.get_json(silent=True) or {}
+    shipment_id = data.get("shipment_id")
+    if not shipment_id:
+        return error_response("shipment_id is required", 400)
+
+    shipment = Shipment.query.filter_by(shipment_id=shipment_id).first()
+    if not shipment:
+        return error_response(f"Shipment {shipment_id} not found", 404)
+    if not shipment.shiprocket_order_id:
+        return error_response(
+            "Shipment has no Shiprocket order ID — cannot reverse-pickup", 400
+        )
+    if shipment.reverse_awb_code:
+        return success_response(
+            "Return pickup already exists for this shipment",
+            {
+                "shipment_id": shipment.shipment_id,
+                "reverse_awb_code": shipment.reverse_awb_code,
+                "return_shipment_id": shipment.return_shipment_id,
+            },
+        )
+
+    pickup = shipment.delivery_address   # customer address — picked up FROM
+    drop = shipment.pickup_address       # merchant address — delivered TO
+    if not pickup or not drop:
+        return error_response(
+            "Both pickup and delivery addresses must exist on the original shipment",
+            400,
+        )
+
+    return_payload = {
+        "order_id": f"RTN-{shipment.order_id}-{shipment.shipment_id}",
+        "order_date": shipment.shipped_date.strftime("%Y-%m-%d %H:%M") if shipment.shipped_date else "",
+        "channel_id": "",
+        "pickup_customer_name": pickup.contact_name or "",
+        "pickup_last_name": "",
+        "pickup_address": pickup.address_line1 or "",
+        "pickup_address_2": getattr(pickup, "address_line2", "") or "",
+        "pickup_city": pickup.city,
+        "pickup_state": pickup.state_province,
+        "pickup_country": pickup.country_code or "India",
+        "pickup_pincode": pickup.postal_code,
+        "pickup_email": "",
+        "pickup_phone": pickup.contact_phone or "",
+        "shipping_customer_name": drop.contact_name or "",
+        "shipping_last_name": "",
+        "shipping_address": drop.address_line1 or "",
+        "shipping_address_2": getattr(drop, "address_line2", "") or "",
+        "shipping_city": drop.city,
+        "shipping_state": drop.state_province,
+        "shipping_country": drop.country_code or "India",
+        "shipping_pincode": drop.postal_code,
+        "shipping_email": "",
+        "shipping_phone": drop.contact_phone or "",
+        "order_items": [{
+            "name": f"Return for order {shipment.order_id}",
+            "sku": f"RTN-{shipment.order_id}",
+            "units": 1,
+            "selling_price": "1",
+        }],
+        "payment_method": "Prepaid",
+        "sub_total": 1,
+        "length": 10, "breadth": 10, "height": 10, "weight": 0.5,
+    }
+
+    try:
+        shiprocket = ShipRocketController()
+        response = shiprocket.create_return_order(return_payload)
+    except Exception as e:
+        current_app.logger.exception("Return pickup SR call failed")
+        return error_response(f"Reverse pickup creation failed: {str(e)}", 502)
+
+    if response.get("status") != 200:
+        return error_response(
+            f"Shiprocket rejected reverse pickup: {response.get('message', 'Unknown error')}",
+            502,
+        )
+
+    sr_data = response.get("data", {}) or {}
+    shipment.return_shipment_id = sr_data.get("shipment_id")
+    shipment.reverse_awb_code = (
+        sr_data.get("awb_code")
+        or (sr_data.get("response", {}) or {}).get("awb_code")
+    )
+    db.session.commit()
+
+    return success_response("Return pickup scheduled successfully", {
+        "shipment_id": shipment.shipment_id,
+        "return_shipment_id": shipment.return_shipment_id,
+        "reverse_awb_code": shipment.reverse_awb_code,
+        "shiprocket_response": response,
+    })
+
+
 @shiprocket_bp.route('/webhook', methods=['POST'])
 def shiprocket_webhook():
     """

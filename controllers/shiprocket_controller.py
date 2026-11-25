@@ -223,19 +223,54 @@ class ShipRocketController:
     def create_order(self, order_data):
         """
         Create order in ShipRocket
-        
+
         Args:
             order_data (dict): Order data for ShipRocket
-        
+
         Returns:
             dict: ShipRocket order response with order_id and shipment_id
         """
         try:
             response = self._make_request('POST', 'orders/create/adhoc', data=order_data)
             return response
-            
+
         except Exception as e:
             current_app.logger.error(f"ShipRocket order creation failed: {str(e)}")
+            raise
+
+    def create_return_order(self, return_data):
+        """
+        Create a REVERSE (return) order in ShipRocket.
+
+        Shiprocket's reverse-pickup endpoint takes the same shape as a normal
+        order but with the pickup and delivery addresses swapped — the item
+        is picked up from the customer and delivered back to the merchant.
+
+        Returns the raw SR response. On success, response['data'] contains
+        'order_id' and 'shipment_id' for the reverse shipment.
+        """
+        try:
+            return self._make_request('POST', 'orders/create/return', data=return_data)
+        except Exception as e:
+            current_app.logger.error(f"ShipRocket return order creation failed: {str(e)}")
+            raise
+
+    def generate_label(self, shipment_id):
+        """
+        Generate a printable shipping label PDF for an existing SR shipment.
+
+        Shiprocket accepts a LIST of shipment_ids; we wrap the single-shipment
+        case for convenience. On success, response['label_url'] is a public
+        PDF URL that expires after ~72 hours — persist it on Shipment.label_url
+        and let the merchant click through.
+        """
+        try:
+            return self._make_request(
+                'POST', 'courier/generate/label',
+                data={"shipment_id": [int(shipment_id)]},
+            )
+        except Exception as e:
+            current_app.logger.error(f"ShipRocket label generation failed: {str(e)}")
             raise
     
     def assign_awb(self, shipment_id, courier_id):
