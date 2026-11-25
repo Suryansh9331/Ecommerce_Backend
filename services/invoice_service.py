@@ -12,6 +12,8 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from models.order import Order, OrderItem
 from models.enums import PaymentStatusEnum
+from models.invoice import Invoice
+from services.invoice_numbering_service import issue_invoice
 
 # Result of build_invoice_data is a dict; these statuses are considered "paid".
 PAID_PAYMENT_STATUSES = {PaymentStatusEnum.SUCCESSFUL, PaymentStatusEnum.PARTIALLY_REFUNDED, PaymentStatusEnum.REFUNDED}
@@ -85,6 +87,7 @@ def _seller_block(order):
         "multi_seller": len(merchants) > 1,
         "seller_count": len(merchants),
         "_primary_state": _norm_state(primary.state_province if primary else None),
+        "primary_merchant_obj": primary,
     }
 
 
@@ -146,10 +149,18 @@ def build_invoice_data(order_id, user_id, require_paid=True):
         if m and m.business_name:
             merchant_name = m.business_name
 
+        # HSN is captured on the Product (Meesho wizard, Sprint 1). Show "-"
+        # if the product predates the HSN column or has been deleted.
+        hsn_code = ""
+        product = getattr(item, "product", None)
+        if product and getattr(product, "hsn_code", None):
+            hsn_code = product.hsn_code
+
         line_items.append({
             "sl": idx,
             "name": item.product_name_at_purchase or "Item",
             "sku": item.sku_at_purchase or "",
+            "hsn_code": hsn_code,
             "merchant_name": merchant_name,
             "quantity": qty,
             "gst_rate": gst_rate,
@@ -198,8 +209,35 @@ def build_invoice_data(order_id, user_id, require_paid=True):
         tax_mode = "IGST"
 
     order_date = order.order_date
+
+    # Allocate (or reuse) a GST-compliant sequential invoice number for this
+    # order. Format: INV/2026-27/000001. Registry row is created on first
+    # download; subsequent downloads of the same order return the same number
+    # so customers see consistent documentation.
+    primary_merchant_id = None
+    primary_merchant_row = seller.get("primary_merchant_obj")
+    if primary_merchant_row is not None:
+        primary_merchant_id = getattr(primary_merchant_row, "id", None)
+
+    existing_invoice = (
+        Invoice.query
+        .filter_by(order_id=order.order_id, merchant_id=primary_merchant_id)
+        .first()
+    )
+    if existing_invoice is None:
+        invoice_row = issue_invoice(
+            order_id=order.order_id,
+            merchant_id=primary_merchant_id,
+            taxable_value=total_taxable,
+            total_gst=total_tax,
+            total_amount=_money(order.total_amount),
+        )
+        invoice_number = invoice_row.invoice_number
+    else:
+        invoice_number = existing_invoice.invoice_number
+
     return {
-        "invoice_number": f"INV-{order.order_id}",
+        "invoice_number": invoice_number,
         "order_id": order.order_id,
         "order_date": order_date,
         "currency": order.currency or "INR",

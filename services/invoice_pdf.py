@@ -112,8 +112,10 @@ def render_invoice_pdf(data):
     elems.append(party)
     elems.append(Spacer(1, 10))
 
-    # Line items table
-    head = ["#", "Item", "Qty", "GST%", f"Taxable ({currency})", f"Tax ({currency})", f"Total ({currency})"]
+    # Line items table. HSN column is mandated by Rule 46 of CGST Rules for
+    # most B2B invoices (optional only for turnover < Rs 5 cr AND B2C). We
+    # show it unconditionally so invoices are always compliant.
+    head = ["#", "Item", "HSN", "Qty", "GST%", f"Taxable ({currency})", f"Tax ({currency})", f"Total ({currency})"]
     rows = [head]
     for li in data.get("line_items", []):
         name = li.get("name", "Item")
@@ -124,13 +126,18 @@ def render_invoice_pdf(data):
         rows.append([
             str(li.get("sl", "")),
             Paragraph(name, small),
+            li.get("hsn_code", "") or "—",
             str(li.get("quantity", 0)),
             f"{float(li.get('gst_rate', 0)):.0f}%",
             f"{float(li.get('taxable_value', 0)):,.2f}",
             f"{float(li.get('tax_amount', 0)):,.2f}",
             f"{float(li.get('line_total', 0)):,.2f}",
         ])
-    items_tbl = Table(rows, colWidths=[8 * mm, 66 * mm, 12 * mm, 14 * mm, 26 * mm, 22 * mm, 26 * mm], repeatRows=1)
+    items_tbl = Table(
+        rows,
+        colWidths=[8 * mm, 56 * mm, 14 * mm, 12 * mm, 14 * mm, 24 * mm, 20 * mm, 26 * mm],
+        repeatRows=1,
+    )
     items_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), BRAND_COLOR),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
