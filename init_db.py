@@ -1050,6 +1050,45 @@ def migrate_meesho_product_fields():
         print(f"✗ Failed to add Meesho product columns: {str(e)}")
 
 
+def migrate_commission_columns():
+    """Idempotently add Phase 2 Sprint 1 commission columns.
+
+    Adds:
+      * categories.commission_pct — per-category commission override
+      * merchant_profiles.commission_pct_override — per-merchant override
+    Both nullable; NULL means fall back to platform default.
+    """
+    print("\nMigrating commission columns:")
+    print("-----------------------------")
+
+    inspector = db.inspect(db.engine)
+    table_cols = {}
+    for table in ('categories', 'merchant_profiles'):
+        if table not in inspector.get_table_names():
+            print(f"✗ {table} table does not exist, skipping")
+            return
+        table_cols[table] = {c['name'] for c in inspector.get_columns(table)}
+
+    pending = []
+    if 'commission_pct' not in table_cols['categories']:
+        pending.append(('categories', 'commission_pct', 'DECIMAL(5,2) NULL'))
+    if 'commission_pct_override' not in table_cols['merchant_profiles']:
+        pending.append(('merchant_profiles', 'commission_pct_override', 'DECIMAL(5,2) NULL'))
+
+    if not pending:
+        print("✓ Commission columns already present")
+        return
+
+    try:
+        with db.engine.connect() as conn:
+            for table, col, ddl in pending:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                print(f"  + added {table}.{col}")
+            conn.commit()
+        print(f"✓ Added {len(pending)} commission column(s)")
+    except Exception as e:
+        print(f"✗ Failed to add commission columns: {str(e)}")
+
 
 def migrate_date_of_birth_gender_columns():
     """Add date_of_birth and gender columns to users table if they don't exist."""
@@ -1757,6 +1796,7 @@ def init_database():
         # Run migrations
         migrate_profile_img_column()
         migrate_meesho_product_fields()
+        migrate_commission_columns()
 
         # Verify all tables are created
         verify_all_tables()
