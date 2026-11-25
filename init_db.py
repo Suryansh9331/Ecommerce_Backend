@@ -1095,6 +1095,71 @@ def migrate_shipment_tracking_columns():
         print(f"✗ Failed to add shipment tracking columns: {str(e)}")
 
 
+def seed_hsn_gst_mapping():
+    """Seed the hsn_gst_mapping table with common HSN codes.
+
+    Safe to run every boot — only inserts codes that don't already exist.
+    """
+    print("\nSeeding HSN → GST mapping:")
+    print("--------------------------")
+
+    inspector = db.inspect(db.engine)
+    if 'hsn_gst_mapping' not in inspector.get_table_names():
+        print("✗ hsn_gst_mapping table does not exist, skipping")
+        return
+
+    try:
+        from services.hsn_seed import seed
+        result = seed(replace_existing=False)
+        if result["inserted"] > 0:
+            print(f"✓ Inserted {result['inserted']} new HSN codes "
+                  f"(seed total: {result['total_in_seed']})")
+        else:
+            print(f"✓ HSN seed already current ({result['total_in_seed']} codes)")
+    except Exception as e:
+        print(f"✗ Failed to seed HSN mapping: {str(e)}")
+
+
+def migrate_commission_columns():
+    """Idempotently add Phase 2 Sprint 1 commission columns.
+
+    Adds:
+      * categories.commission_pct — per-category commission override
+      * merchant_profiles.commission_pct_override — per-merchant override
+    Both nullable; NULL means fall back to platform default.
+    """
+    print("\nMigrating commission columns:")
+    print("-----------------------------")
+
+    inspector = db.inspect(db.engine)
+    table_cols = {}
+    for table in ('categories', 'merchant_profiles'):
+        if table not in inspector.get_table_names():
+            print(f"✗ {table} table does not exist, skipping")
+            return
+        table_cols[table] = {c['name'] for c in inspector.get_columns(table)}
+
+    pending = []
+    if 'commission_pct' not in table_cols['categories']:
+        pending.append(('categories', 'commission_pct', 'DECIMAL(5,2) NULL'))
+    if 'commission_pct_override' not in table_cols['merchant_profiles']:
+        pending.append(('merchant_profiles', 'commission_pct_override', 'DECIMAL(5,2) NULL'))
+
+    if not pending:
+        print("✓ Commission columns already present")
+        return
+
+    try:
+        with db.engine.connect() as conn:
+            for table, col, ddl in pending:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                print(f"  + added {table}.{col}")
+            conn.commit()
+        print(f"✓ Added {len(pending)} commission column(s)")
+    except Exception as e:
+        print(f"✗ Failed to add commission columns: {str(e)}")
+
+
 def migrate_order_lifecycle_columns():
     """Idempotently add Phase 2 Sprint 2 fulfillment lifecycle columns to orders."""
     print("\nMigrating Order lifecycle columns:")
@@ -1836,6 +1901,8 @@ def init_database():
         migrate_profile_img_column()
         migrate_meesho_product_fields()
         migrate_shipment_tracking_columns()
+        migrate_commission_columns()
+        seed_hsn_gst_mapping()
         migrate_order_lifecycle_columns()
 
         # Verify all tables are created

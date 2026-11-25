@@ -238,6 +238,11 @@ class MerchantProfile(BaseModel):
     sales_tax_number = db.Column(db.String(50), nullable=True)  # For GLOBAL: Sales Tax Number
     
     
+    # Per-merchant commission override. NULL = fall back to Category.commission_pct,
+    # which itself falls back to the platform default (CommissionService.DEFAULT_PCT).
+    # Stored as percent (e.g. 2.50 = 2.5%).
+    commission_pct_override = db.Column(db.Numeric(5, 2), nullable=True)
+
     # Bank Account Information
     bank_account_number = db.Column(db.String(50), nullable=True)
     bank_name = db.Column(db.String(100), nullable=True)

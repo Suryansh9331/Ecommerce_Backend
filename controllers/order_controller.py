@@ -460,7 +460,9 @@ class OrderController:
         }
 
     @staticmethod
-    def update_order_status(order_id, new_status_enum: OrderStatusEnum, user_id_performing_action, notes=None):
+    def update_order_status(order_id, new_status_enum: OrderStatusEnum, user_id_performing_action, notes=None, allow_admin_override=False):
+        from services.order_status_transitions import validate_transition, IllegalStatusTransition
+
         order = Order.query.get(order_id)
         if not order:
             raise ValueError(f"Order with ID {order_id} not found.")
@@ -468,6 +470,18 @@ class OrderController:
         if order.order_status == new_status_enum:
             current_app.logger.info(f"Order {order_id} already in status {new_status_enum.value}. No update performed.")
             return order.serialize(include_items=True, include_history=True) # Or return a specific message
+
+        # Block illegal jumps (e.g., DELIVERED -> PENDING_PAYMENT).
+        # Pre-Phase-2 this was unguarded; now we refuse unless the caller
+        # explicitly passes allow_admin_override.
+        try:
+            validate_transition(
+                order.order_status,
+                new_status_enum,
+                allow_admin_override=allow_admin_override,
+            )
+        except IllegalStatusTransition as e:
+            raise ValueError(str(e))
 
         previous_status_val = order.order_status.value
         order.order_status = new_status_enum

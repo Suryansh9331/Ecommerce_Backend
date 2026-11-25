@@ -9,6 +9,7 @@ import logging
 
 from auth.utils import merchant_role_required
 from common.decorators import rate_limit, cache_response
+from common.gstin_validator import is_valid_gstin_format, normalize_gstin
 from auth.models import User, MerchantProfile
 from models.user_merchant_follow import UserMerchantFollow
 from auth.models.merchant_document import VerificationStatus, DocumentType, MerchantDocument
@@ -106,8 +107,22 @@ class UpdateProfileSchema(Schema):
             # Validate Indian-specific fields
             if data.get('bank_ifsc_code') and len(data['bank_ifsc_code']) != 11:
                 errors['bank_ifsc_code'] = ['Length must be between 11 and 11.']
-            if data.get('gstin') and len(data['gstin']) > 15:
-                errors['gstin'] = ['Length must be between 0 and 15.']
+            gstin_in = data.get('gstin')
+            if gstin_in:
+                # Format check: 15 chars, valid state code prefix, correct
+                # PAN + entity + checksum pattern. Legitimacy (is this GSTIN
+                # actually registered?) requires the paid GSTN API — deferred
+                # to Phase 3. See common/gstin_validator.py for the warranty
+                # rationale.
+                if not is_valid_gstin_format(gstin_in):
+                    errors['gstin'] = [
+                        'Invalid GSTIN format. Expected 15 characters like '
+                        '22ABCDE1234F1Z5 with a valid state code prefix.'
+                    ]
+                else:
+                    # Store normalized (uppercased) so downstream code never
+                    # has to handle case variants.
+                    data['gstin'] = normalize_gstin(gstin_in)
             if data.get('pan_number') and len(data['pan_number']) > 10:
                 errors['pan_number'] = ['Length must be between 0 and 10.']
         else:  # GLOBAL
