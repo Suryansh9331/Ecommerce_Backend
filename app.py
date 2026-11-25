@@ -1122,6 +1122,40 @@ def create_app(config_name=None):
     except Exception as e:
         app.logger.error(f"Failed to start intro video purge scheduler: {str(e)}")
 
+    # Shiprocket status sync — safety net for missed webhooks. Polls SR every
+    # 15 min for shipments that haven't been updated recently.
+    def start_shipment_status_sync_scheduler():
+        sched = BackgroundScheduler()
+
+        def sync_job():
+            with app.app_context():
+                from services.shipment_status_sync import sync_pending_shipment_statuses
+
+                try:
+                    sync_pending_shipment_statuses(logger=app.logger)
+                except Exception as e:
+                    app.logger.error(
+                        "Shipment status sync job failed: %s", e, exc_info=True
+                    )
+
+        sched.add_job(
+            sync_job,
+            "interval",
+            minutes=15,
+            id="shipment_status_sync",
+            replace_existing=True,
+            max_instances=1,
+        )
+        sched.start()
+        app.logger.info("Shipment status sync scheduler started (every 15 min)")
+
+    try:
+        start_shipment_status_sync_scheduler()
+    except Exception as e:
+        app.logger.error(
+            f"Failed to start shipment status sync scheduler: {str(e)}"
+        )
+
     return app
 
 if __name__ == "__main__":
