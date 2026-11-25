@@ -1050,6 +1050,31 @@ def migrate_meesho_product_fields():
         print(f"✗ Failed to add Meesho product columns: {str(e)}")
 
 
+def seed_hsn_gst_mapping():
+    """Seed the hsn_gst_mapping table with common HSN codes.
+
+    Safe to run every boot — only inserts codes that don't already exist.
+    """
+    print("\nSeeding HSN → GST mapping:")
+    print("--------------------------")
+
+    inspector = db.inspect(db.engine)
+    if 'hsn_gst_mapping' not in inspector.get_table_names():
+        print("✗ hsn_gst_mapping table does not exist, skipping")
+        return
+
+    try:
+        from services.hsn_seed import seed
+        result = seed(replace_existing=False)
+        if result["inserted"] > 0:
+            print(f"✓ Inserted {result['inserted']} new HSN codes "
+                  f"(seed total: {result['total_in_seed']})")
+        else:
+            print(f"✓ HSN seed already current ({result['total_in_seed']} codes)")
+    except Exception as e:
+        print(f"✗ Failed to seed HSN mapping: {str(e)}")
+
+
 def migrate_commission_columns():
     """Idempotently add Phase 2 Sprint 1 commission columns.
 
@@ -1797,6 +1822,7 @@ def init_database():
         migrate_profile_img_column()
         migrate_meesho_product_fields()
         migrate_commission_columns()
+        seed_hsn_gst_mapping()
 
         # Verify all tables are created
         verify_all_tables()

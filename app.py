@@ -27,6 +27,7 @@ from routes.user_account_deletion_routes import user_account_deletion_bp
 from routes.product_routes import product_bp
 from routes.category_routes import category_bp
 from routes.brand_routes import brand_bp
+from routes.hsn_routes import hsn_bp
 from routes.homepage_routes import homepage_bp
 from routes.explore_banner_routes import explore_banner_bp
 from routes.cart_routes import cart_bp
@@ -280,9 +281,11 @@ def create_app(config_name=None):
                 from init_db import (
                     migrate_meesho_product_fields,
                     migrate_commission_columns,
+                    seed_hsn_gst_mapping,
                 )
                 migrate_meesho_product_fields()
                 migrate_commission_columns()
+                seed_hsn_gst_mapping()
             except Exception as e:
                 print(f"[boot] Skipped Meesho product field migration: {e}")
 
@@ -409,6 +412,7 @@ def create_app(config_name=None):
     app.register_blueprint(product_bp)
     app.register_blueprint(category_bp, url_prefix='/api/categories')
     app.register_blueprint(brand_bp, url_prefix='/api/brands')
+    app.register_blueprint(hsn_bp)
     app.register_blueprint(homepage_bp, url_prefix='/api/homepage')
     app.register_blueprint(explore_banner_bp)
     app.register_blueprint(cart_bp, url_prefix='/api/cart')
