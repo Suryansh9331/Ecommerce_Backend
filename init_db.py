@@ -1050,6 +1050,39 @@ def migrate_meesho_product_fields():
         print(f"✗ Failed to add Meesho product columns: {str(e)}")
 
 
+def migrate_order_lifecycle_columns():
+    """Idempotently add Phase 2 Sprint 2 fulfillment lifecycle columns to orders."""
+    print("\nMigrating Order lifecycle columns:")
+    print("----------------------------------")
+
+    inspector = db.inspect(db.engine)
+    if 'orders' not in inspector.get_table_names():
+        print("✗ orders table does not exist, skipping")
+        return
+
+    existing_columns = {c['name'] for c in inspector.get_columns('orders')}
+    new_columns = [
+        ('accepted_at',      'DATETIME NULL'),
+        ('rts_marked_at',    'DATETIME NULL'),
+        ('sla_breached',     'BOOLEAN NOT NULL DEFAULT 0'),
+        ('eway_bill_number', 'VARCHAR(32) NULL'),
+    ]
+    missing = [(n, ddl) for n, ddl in new_columns if n not in existing_columns]
+
+    if not missing:
+        print("✓ Order lifecycle columns already present")
+        return
+
+    try:
+        with db.engine.connect() as conn:
+            for name, ddl in missing:
+                conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {ddl}"))
+                print(f"  + added orders.{name}")
+            conn.commit()
+        print(f"✓ Added {len(missing)} order lifecycle columns")
+    except Exception as e:
+        print(f"✗ Failed to add order lifecycle columns: {str(e)}")
+
 
 def migrate_date_of_birth_gender_columns():
     """Add date_of_birth and gender columns to users table if they don't exist."""
@@ -1757,6 +1790,7 @@ def init_database():
         # Run migrations
         migrate_profile_img_column()
         migrate_meesho_product_fields()
+        migrate_order_lifecycle_columns()
 
         # Verify all tables are created
         verify_all_tables()

@@ -64,6 +64,21 @@ class Order(BaseModel):
     customer_notes = db.Column(db.Text, nullable=True)
     internal_notes = db.Column(db.Text, nullable=True)
 
+    # Phase 2 Sprint 2 — merchant fulfillment lifecycle milestones.
+    # `accepted_at` is set when the merchant clicks "Accept Order" (starts SLA timer).
+    # `rts_marked_at` is set when "Mark Ready to Ship" is clicked (stops SLA timer,
+    # triggers Shiprocket label + invoice-number allocation).
+    # `sla_breached` is flipped to True by a daily scheduler when accepted_at
+    # was more than 48h ago and rts_marked_at is still NULL.
+    accepted_at = db.Column(db.DateTime, nullable=True)
+    rts_marked_at = db.Column(db.DateTime, nullable=True)
+    sla_breached = db.Column(db.Boolean, nullable=False, default=False, server_default='0')
+
+    # E-way bill number — mandatory for inter-state shipments > Rs 50,000.
+    # Merchants generate it manually on ewaybillgst.gov.in (Phase 2 defers paid
+    # EWB API). We just store the number and print it on the invoice.
+    eway_bill_number = db.Column(db.String(32), nullable=True)
+
 
     user = db.relationship('User',back_populates='orders')
     
@@ -106,6 +121,10 @@ class Order(BaseModel):
             "billing_address_id": self.billing_address_id,
             "shipping_method_name": self.shipping_method_name,
             "customer_notes": self.customer_notes,
+            "accepted_at": self.accepted_at.isoformat() if self.accepted_at else None,
+            "rts_marked_at": self.rts_marked_at.isoformat() if self.rts_marked_at else None,
+            "sla_breached": bool(self.sla_breached),
+            "eway_bill_number": self.eway_bill_number,
             "created_at": self.created_at.isoformat() if hasattr(self, 'created_at') and self.created_at else None,
             "updated_at": self.updated_at.isoformat() if hasattr(self, 'updated_at') and self.updated_at else None,
             "shipping_address_details": self.shipping_address_obj.serialize() if self.shipping_address_obj else None,
