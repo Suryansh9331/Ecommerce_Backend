@@ -1,10 +1,11 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from controllers.shiprocket_controller import ShipRocketController
-from auth.utils import super_admin_role_required , merchant_role_required 
+from auth.utils import super_admin_role_required , merchant_role_required
 from common.response import success_response, error_response
+from services.shiprocket_webhook import process_shiprocket_webhook, WebhookError
+import os
 import traceback
 from flask_jwt_extended import jwt_required
-from flask import current_app
 
 shiprocket_bp = Blueprint('shiprocket', __name__, url_prefix='/api/shiprocket')
 
@@ -972,6 +973,42 @@ def get_shop_pickup_location(shop_id):
             "pickup_location_name": pickup_location_name,
             "shop_id": shop_id
         })
-        
+
     except Exception as e:
-        return error_response(f"Failed to get shop pickup location: {str(e)}", 500) 
+        return error_response(f"Failed to get shop pickup location: {str(e)}", 500)
+
+
+@shiprocket_bp.route('/webhook', methods=['POST'])
+def shiprocket_webhook():
+    """
+    Receive shipment status updates pushed by Shiprocket.
+
+    Shiprocket calls this endpoint whenever a shipment progresses (shipped →
+    in-transit → out-for-delivery → delivered, or exception/RTO). We verify
+    the shared-secret token (header `X-Api-Key`) matches
+    `SHIPROCKET_WEBHOOK_TOKEN` configured on the server, then update the
+    local Shipment + Order rows.
+
+    Public endpoint — not JWT-protected — since Shiprocket cannot send our
+    user tokens. Security = token in header.
+    """
+    expected_token = os.getenv("SHIPROCKET_WEBHOOK_TOKEN")
+    received_token = request.headers.get("X-Api-Key") or request.headers.get("x-api-key")
+
+    payload = request.get_json(silent=True)
+
+    try:
+        result = process_shiprocket_webhook(
+            payload=payload or {},
+            received_token=received_token,
+            expected_token=expected_token,
+        )
+    except WebhookError as e:
+        current_app.logger.warning(f"Shiprocket webhook rejected: {e}")
+        return jsonify({"status": "error", "message": str(e)}), e.http_status
+    except Exception as e:
+        current_app.logger.exception("Shiprocket webhook handler crashed")
+        return jsonify({"status": "error", "message": "Internal error"}), 500
+
+    # Return 200 quickly so Shiprocket doesn't retry
+    return jsonify({"status": "ok", "changes": result}), 200 
