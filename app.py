@@ -277,8 +277,12 @@ def create_app(config_name=None):
     if os.getenv('RUN_BOOT_MIGRATIONS', 'false').lower() in ('1', 'true', 'yes'):
         with app.app_context():
             try:
-                from init_db import migrate_meesho_product_fields
+                from init_db import (
+                    migrate_meesho_product_fields,
+                    migrate_shipment_tracking_columns,
+                )
                 migrate_meesho_product_fields()
+                migrate_shipment_tracking_columns()
             except Exception as e:
                 print(f"[boot] Skipped Meesho product field migration: {e}")
 
