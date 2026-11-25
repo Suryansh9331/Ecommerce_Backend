@@ -3468,6 +3468,101 @@ def get_merchant_order_details(order_id):
         current_app.logger.error(f"Error getting merchant order details: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
 
+
+# ---------- Phase 2 Sprint 2: fulfillment lifecycle endpoints ----------
+
+@merchant_dashboard_bp.route('/orders/<order_id>/accept', methods=['POST'])
+@merchant_role_required
+def accept_merchant_order(order_id):
+    """Merchant accepts a newly-placed order (starts SLA timer).
+
+    Response fields:
+      * accepted_at — UTC timestamp
+      * order_status — resulting status (processing)
+      * already_accepted — true if this was a no-op
+    """
+    try:
+        user_id = get_jwt_identity()
+        result = MerchantOrderController.accept_order(user_id=user_id, order_id=order_id)
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        current_app.logger.error(f"accept_merchant_order error on {order_id}: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@merchant_dashboard_bp.route('/orders/<order_id>/mark-rts', methods=['POST'])
+@merchant_role_required
+def mark_rts_merchant_order(order_id):
+    """Merchant marks a processing order Ready-To-Ship.
+
+    Body (optional): { "courier_id": <int> }
+    Allocates the FY-aware invoice number and triggers Shiprocket.
+    Returns label_url when the carrier returned one.
+    """
+    try:
+        user_id = get_jwt_identity()
+        payload = request.get_json(silent=True) or {}
+        courier_id = payload.get('courier_id')
+        result = MerchantOrderController.mark_rts(
+            user_id=user_id, order_id=order_id, courier_id=courier_id
+        )
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        current_app.logger.error(f"mark_rts_merchant_order error on {order_id}: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@merchant_dashboard_bp.route('/orders/bulk-rts', methods=['POST'])
+@merchant_role_required
+def bulk_rts_merchant_orders():
+    """Merchant marks multiple orders Ready-To-Ship in one call.
+
+    Body: { "order_ids": ["ORD-...","ORD-..."], "courier_id": 123 }
+    Returns per-order results — a failure in one does not abort the rest.
+    """
+    try:
+        user_id = get_jwt_identity()
+        payload = request.get_json(silent=True) or {}
+        order_ids = payload.get('order_ids') or []
+        courier_id = payload.get('courier_id')
+        result = MerchantOrderController.bulk_rts(
+            user_id=user_id, order_ids=order_ids, courier_id=courier_id
+        )
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        current_app.logger.error(f"bulk_rts_merchant_orders error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@merchant_dashboard_bp.route('/orders/<order_id>/eway-bill', methods=['POST'])
+@merchant_role_required
+def set_order_eway_bill(order_id):
+    """Record the manually-generated e-way bill number on an order.
+
+    Body: { "eway_bill_number": "<12-digit>" }
+    Required by GST rules for inter-state shipments valued > Rs 50,000.
+    """
+    try:
+        user_id = get_jwt_identity()
+        payload = request.get_json(silent=True) or {}
+        eb = payload.get('eway_bill_number')
+        result = MerchantOrderController.set_eway_bill(
+            user_id=user_id, order_id=order_id, eway_bill_number=eb
+        )
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        current_app.logger.error(f"set_order_eway_bill error on {order_id}: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+
 @merchant_dashboard_bp.route('/orders/stats', methods=['GET'])
 @jwt_required()
 def get_merchant_order_stats():
